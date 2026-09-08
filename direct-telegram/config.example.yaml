@@ -1,0 +1,40 @@
+# 맥붐 다이렉트 봇 설정. 이 파일을 config.yaml로 복사해서 토큰을 채우세요.
+#   cp config.example.yaml config.yaml
+
+telegram:
+  # BotFather에서 새로 만든 봇의 토큰. Hermes 봇 토큰을 재사용하면 두 프로세스가
+  # 같은 getUpdates를 놓고 경쟁해 메시지를 서로 뺏어가므로 반드시 별도 봇을 쓸 것.
+  token: "<BotFather에서-받은-새-봇-토큰>"
+  # 로컬 telegram-bot-api 서버(이미 8081에 떠 있음). 클라우드 API를 쓰려면
+  # https://api.telegram.org 로 바꾸면 된다(이때 setup_bot.sh의 logOut은 하지 말 것).
+  api_base: "http://127.0.0.1:8081"
+  # 이 chat id만 봇을 쓸 수 있다. 비우면 누구나 쓸 수 있으니 반드시 채울 것.
+  allowed_chat_ids:
+    - 47980209   # 승영 김 (마스터)
+
+llm:
+  base_url: "http://127.0.0.1:8766/v1"   # oMLX
+  api_key: "omlx"
+  # medium은 대화가 길어질수록 응답이 기하급수적으로 느려진다(실측 342초). low 유지 권장.
+  reasoning_effort: "low"
+  max_tokens: 4000
+  temperature: 0.4
+  request_timeout: 900
+
+# Hermes와 같은 영혼 파일을 그대로 읽는다. 고치면 텔레그램에서 /soul 로 리로드.
+soul_path: "~/Claude_works/hermes-agent/data/SOUL.md"
+workdir: "~/Claude_works"
+
+agent:
+  persona_name: "붐엘"        # 이 채널에서 쓰는 이름 (영혼은 맥붐 SOUL.md 그대로)
+  max_tool_steps: 8          # 한 요청에서 허용할 도구 왕복 횟수
+  history_max_chars: 40000   # 넘으면 오래된 '턴' 단위로 통째로 버림
+  show_tool_progress: true   # 도구 실행 상황을 텔레그램에 한 줄로 표시
+  auto_boomco_on_x_link: true  # X 링크만 있는 메시지는 바로 붐코 파이프라인 (Hermes 훅과 동일)
+
+safety:
+  approval_timeout: 300      # 승인 대기 시간(초). 넘으면 자동 거부.
+  # 아래 3개는 비워두면 macboom_direct.py의 기본값이 쓰인다. 필요할 때만 덮어쓸 것.
+  # danger_patterns: []      # 이 정규식에 걸리는 셸/파이썬은 텔레그램 승인 필요
+  # protected_paths: []      # 읽기/쓰기에 승인이 필요한 경로(비밀정보·시스템 설정)
+  # write_roots: []          # 승인 없이 쓸 수 있는 루트. 이 밖은 승인 필요.

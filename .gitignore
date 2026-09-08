@@ -9,3 +9,7 @@ state/
 
 # 개인 초안/미완성 제안 파일
 proxy.refactor-proposal.mjs
+
+# 다이렉트 텔레그램 봇 토큰이 들어있는 실제 설정 (예시 파일만 커밋)
+direct-telegram/config.yaml
+direct-telegram/bot.*.log

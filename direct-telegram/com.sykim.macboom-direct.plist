@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sykim.macboom-direct</string>
+
+    <!-- Hermes venv가 아니라 시스템 파이썬으로 돈다 (게이트웨이와 완전 분리). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/sykim/Claude_works/local-llm/direct-telegram/macboom_direct.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/sykim/Claude_works/local-llm/direct-telegram</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/sykim/Claude_works/local-llm/direct-telegram/bot.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sykim/Claude_works/local-llm/direct-telegram/bot.err.log</string>
+</dict>
+</plist>
