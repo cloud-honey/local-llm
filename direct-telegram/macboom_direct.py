@@ -209,6 +209,8 @@ class LocalLLM(object):
         self.max_tokens = int(llm.get("max_tokens") or 4000)
         self.temperature = float(llm.get("temperature") or 0.4)
         self.timeout = int(llm.get("request_timeout") or 900)
+        # config 의 llm.model 을 채우면 그 모델로 고정한다 (교체 시험 중 고정용).
+        self.pinned = (llm.get("model") or "").strip()
         self._model = None
         self._model_at = 0.0
         self.session = requests.Session()
@@ -218,15 +220,31 @@ class LocalLLM(object):
         return {"Authorization": "Bearer %s" % self.key, "Content-Type": "application/json"}
 
     def model(self):
-        """모델명을 하드코딩하지 않고 매번 조회(30초 캐싱) — proxy.mjs와 같은 규약."""
+        """모델명을 하드코딩하지 않되 **서버가 정한 기본 모델**을 따른다 (30초 캐싱).
+
+        2026-09-09 사고: 여기서 /v1/models 의 data[0] 을 집었던 탓에, 승인 대기 중이던
+        새 모델을 등록하자마자 이 봇만 조용히 그쪽으로 넘어갔다 — oMLX 의 default_model
+        은 구모델 그대로였는데도. 목록 순서는 어느 모델이 기본인지 뜻하지 않는다.
+        """
         if self._model and time.time() - self._model_at < 30:
             return self._model
-        resp = self.session.get(self.base + "/models", headers=self.headers, timeout=10)
-        resp.raise_for_status()
-        data = (resp.json().get("data") or [])
-        if not data:
-            raise RuntimeError("oMLX에 로드된 모델이 없습니다.")
-        self._model = data[0]["id"]
+        name = self.pinned
+        if not name:
+            root = self.base[:-3].rstrip("/") if self.base.endswith("/v1") else self.base
+            try:
+                name = (self.session.get(root + "/health", headers=self.headers,
+                                         timeout=10).json().get("default_model") or "").strip()
+            except Exception as exc:
+                log("default_model 조회 실패 — 목록 첫 항목으로 폴백:", exc)
+                name = ""
+        if not name:
+            resp = self.session.get(self.base + "/models", headers=self.headers, timeout=10)
+            resp.raise_for_status()
+            data = (resp.json().get("data") or [])
+            if not data:
+                raise RuntimeError("oMLX에 로드된 모델이 없습니다.")
+            name = data[0]["id"]
+        self._model = name
         self._model_at = time.time()
         return self._model
 
@@ -341,6 +359,11 @@ DIRECT_ADDENDUM = """
   뒤에만 실행된다. 거부되면 우회를 시도하지 말고 다른 방법을 제안한다.
 - 상태를 물으면 추측하지 말고 `system_status`나 `run_shell`로 실제 확인한 뒤 답한다.
 - 답변은 텔레그램으로 나간다. **굵게**, ## 제목, `코드`, [링크](url) 정도는 그대로 렌더링되지만\n  마크다운 표는 깨지니 쓰지 마라.
+- **한국어로 답한다.** 이 채널은 도구 출력이 대부분 영어(셸 로그·README·설정 파일)라
+  영어로 끌려가기 쉽다. 무엇을 읽었든 마스터에게 나가는 문장은 한국어로 쓴다.
+  명령어·경로·로그 원문은 그대로 인용하되, 설명은 한국어다.
+- **사고 과정을 그대로 보내지 마라.** 도구를 여러 번 쓴 뒤에는 생각을 정리한 초안이 아니라
+  정리된 결론만 보낸다. 영어로 스스로에게 묻고 답하는 문장이 답변에 섞이면 실패다.
 
 현재 시각: {now} (KST) / 작업 디렉터리: {workdir} / 로컬 모델: {model}
 """
