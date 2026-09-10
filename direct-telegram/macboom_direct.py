@@ -151,15 +151,46 @@ class Telegram(object):
         return "전송 완료: %s" % p.name if res else "전송 실패 (텔레그램 응답 오류)"
 
 
+OFFSET_STATE_PATH = STATE_DIR / "telegram-offset.json"
+
+
 class Stream(object):
-    """업데이트 스트림 — 일반 메시지 큐와 승인 콜백을 한 폴링 루프에서 나눠 담는다."""
+    """업데이트 스트림 — 일반 메시지 큐와 승인 콜백을 한 폴링 루프에서 나눠 담는다.
+
+    2026-09-10: offset을 메모리에만 들고 있으면 프로세스 재시작(예: plist 수정 후
+    bootout+bootstrap) 때마다 Telegram이 "아직 확인 안 된" 업데이트를 다시 보내서
+    직전에 받은 메시지가 중복 recv 되는 게 실측으로 확인됨(elder_plinius 링크가 재시작
+    직후 다시 recv 로그에 찍힘) — 유실은 아니고 중복 재처리(붐코 쪽 409 백엔드가 중복
+    저장은 막아줌)라 무해하지만 낭비. **다만 offset을 fetch 시점에 바로 영속화하면
+    반대 방향 버그(진짜 유실)가 생긴다**: fetch 직후 ~ handle_message 완료 전 사이에
+    크래시하면 그 메시지는 이미 "확인됨" 처리돼 Telegram이 재전송을 안 해준다 —
+    이 봇이 지금 우선순위로 두는 건 "중복 없음"이 아니라 "유실 없음"이므로, 디스크에는
+    **처리가 실제로 끝난 메시지까지만** 반영한다(`ack`). 메모리상의 `self.offset`은
+    기존과 동일하게 fetch 시점에 즉시 전진(같은 폴링 세션 안에서 중복 fetch 방지용).
+    """
 
     def __init__(self, api):
         self.api = api
-        self.offset = None
+        self.offset = self._load_offset()
         self.messages = []
         self.callbacks = {}
         self.texts = []  # 승인 대기 중 도착한 텍스트(예/아니오 판정용)
+        self._pending_ack = None  # 아직 디스크에 반영 안 된, fetch만 된 update_id 중 최댓값
+
+    @staticmethod
+    def _load_offset():
+        try:
+            return json.loads(OFFSET_STATE_PATH.read_text(encoding="utf-8")).get("offset")
+        except Exception:
+            return None
+
+    def ack(self, update_id):
+        """update_id에 해당하는 메시지 처리가 실제로 끝난 뒤에만 호출 — 디스크 offset 전진."""
+        try:
+            OFFSET_STATE_PATH.write_text(
+                json.dumps({"offset": update_id + 1}), encoding="utf-8")
+        except Exception as exc:
+            log("offset 저장 실패:", exc)
 
     def _pump(self, timeout):
         for upd in self.api.get_updates(self.offset, timeout):
@@ -168,6 +199,7 @@ class Stream(object):
                 cq = upd["callback_query"]
                 self.callbacks[cq.get("data", "")] = cq
             elif "message" in upd:
+                upd["message"]["_update_id"] = upd["update_id"]
                 self.messages.append(upd["message"])
 
     def next_message(self, timeout=30):
@@ -585,6 +617,7 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
 
 /new      대화 기록 초기화
 /status   로컬 모델·프로세스·붐코 큐 실제 상태
+/queue    붐코 대기열(대기중/처리중 링크 목록)
 /soul     SOUL.md 다시 읽기(앞부분 미리보기)
 /model    현재 로드된 모델
 /id       내 chat id
@@ -611,6 +644,16 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
                 self.api.send(chat_id, "모델 조회 실패: %s" % exc)
         elif cmd == "/id":
             self.api.send(chat_id, "chat id: %s" % chat_id)
+        elif cmd == "/queue":
+            items = T.queue_load()
+            if not items:
+                self.api.send(chat_id, "붐코 대기열 비어있음 (처리 중/대기 중인 링크 없음)")
+            else:
+                lines = ["붐코 대기열 %d건:" % len(items)]
+                for i, e in enumerate(items, 1):
+                    lines.append("%d. [%s] %s (접수 %s)" % (
+                        i, e.get("status"), e.get("url"), e.get("received_at")))
+                self.api.send(chat_id, "\n".join(lines))
         else:
             self.api.send(chat_id, "모르는 명령입니다. /help 참고.")
 
@@ -635,15 +678,89 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
         if self.auto_boomco:
             urls = T.extract_x_urls(text)
             if urls:
-                self.api.send(chat_id, "🔗 X 링크 %d건 감지 — 붐코 파이프라인으로 순서대로 분석합니다. "
-                                       "(1건당 보통 3~10분)" % len(urls))
-                for url in urls:
-                    notify = lambda text: self.api.send(chat_id, text)
-                    summary, report = T.boomco_analyze(url, chat_id, notify)
-                    self.api.send(chat_id, report or ("분석 실패\n%s\n%s" % (url, summary)))
+                self._enqueue_and_process_boomco(chat_id, urls)
                 return
 
         self.run_agent(chat_id, text)
+
+    # ---------------------------------------------- 붐코 큐 (영속화 + 순차 처리)
+    #
+    # 2026-09-10: 바쁠 때(한 건 분석 중, 3~10분) 링크를 여러 통 따로 보내면 메시지마다
+    # "1건 감지"만 찍혀서 "다 접수는 된 건가?"라는 불안을 유발한다는 실사용 피드백으로
+    # 추가. 메모리 for-loop만 쓰던 걸 디스크에 즉시 기록하는 큐로 바꿔서: ①받는 즉시
+    # "대기열에 몇 건째로 등록됐는지" 보여주고 ②크래시해도 재시작 시 이어서 처리하고
+    # ③`/queue`로 언제든 현재 대기 상태를 확인할 수 있게 한다. 처리 자체는 여전히
+    # 완전 순차(단일 스레드 루프) — 동시 처리로 바꾼 게 아니다.
+
+    def _enqueue_and_process_boomco(self, chat_id, urls):
+        # id로 식별 (같은 url을 두 번 보내는 경우가 실제로 있었음 — url+chat_id만으로
+        # 매칭하면 중복 건 중 하나를 처리한 뒤 나머지까지 같이 지워버리는 버그가 생김).
+        items = T.queue_load()
+        new_entries = []
+        for url in urls:
+            entry = {
+                "id": uuid.uuid4().hex, "url": url, "chat_id": chat_id,
+                "received_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "status": "pending",
+            }
+            items.append(entry)
+            new_entries.append(entry)
+        T.queue_save(items)
+        pending_total = sum(1 for e in items if e.get("status") in ("pending", "processing"))
+        log("queue add", len(new_entries), "chat=%s" % chat_id, "pending_total=%d" % pending_total,
+            "urls=%s" % ",".join(urls))
+        self.api.send(chat_id, (
+            "🔗 X 링크 %d건 접수 (현재 대기열 총 %d건) — 순서대로 분석합니다. "
+            "(1건당 보통 3~10분, 완료될 때마다 결과 전송 / 대기 현황은 /queue)"
+        ) % (len(new_entries), pending_total))
+        for entry in new_entries:
+            self._process_one_boomco(entry)
+
+    def _process_one_boomco(self, entry):
+        eid, url, chat_id = entry.get("id"), entry["url"], entry["chat_id"]
+        items = T.queue_load()
+        for e in items:
+            if e.get("id") == eid:
+                e["status"] = "processing"
+                break
+        T.queue_save(items)
+        remaining = sum(1 for e in items if e.get("status") in ("pending", "processing"))
+        log("queue start", url, "id=%s" % eid, "remaining_incl_self=%d" % remaining)
+        started = time.monotonic()
+
+        notify = lambda text: self.api.send(chat_id, text)
+        try:
+            summary, report = T.boomco_analyze(url, chat_id, notify)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            summary, report = ("예외: %s: %s" % (type(exc).__name__, exc), None)
+
+        elapsed = time.monotonic() - started
+        items = T.queue_load()
+        items = [e for e in items if e.get("id") != eid]
+        T.queue_save(items)
+        remaining = sum(1 for e in items if e.get("status") in ("pending", "processing"))
+        ok = bool(report)
+        log("queue done", url, "id=%s" % eid, "ok=%s" % ok, "elapsed=%.1fs" % elapsed,
+            "remaining=%d" % remaining)
+        self.api.send(chat_id, report or ("분석 실패\n%s\n%s" % (url, summary)))
+
+    def _recover_boomco_queue(self):
+        """비정상 종료로 큐 파일에 남은 게 있으면 기동 시 이어서 처리 (유실 방지)."""
+        items = T.queue_load()
+        if not items:
+            return
+        log("큐 복구:", len(items), "건 남아있음 — 이어서 처리")
+        by_chat = {}
+        for e in items:
+            by_chat.setdefault(e.get("chat_id"), []).append(e.get("url"))
+        for chat_id, urls in by_chat.items():
+            self.api.send(chat_id, (
+                "⚠️ 재시작 전에 처리하지 못하고 남아있던 X 링크 %d건을 이어서 처리합니다:\n%s"
+            ) % (len(urls), "\n".join(urls)))
+        for e in items:
+            self._process_one_boomco(e)
 
     def run(self):
         try:
@@ -655,6 +772,7 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
             log("모델:", self.llm.model())
         except Exception as exc:
             log("모델 조회 실패:", exc)
+        self._recover_boomco_queue()
         while True:
             try:
                 msg = self.stream.next_message(30)
@@ -669,6 +787,13 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
                 traceback.print_exc()
                 chat_id = str((msg.get("chat") or {}).get("id"))
                 self.api.send(chat_id, "처리 중 예외: %s: %s" % (type(exc).__name__, exc))
+            finally:
+                # handle_message가 정상/예외 어느 쪽으로든 "끝까지 시도"한 뒤에만 offset을
+                # 디스크에 반영 — 그 전에 프로세스가 죽으면 Telegram이 재전송해주게 둔다
+                # (유실 방지가 중복 방지보다 우선).
+                update_id = msg.get("_update_id")
+                if update_id is not None:
+                    self.stream.ack(update_id)
 
 
 def main():

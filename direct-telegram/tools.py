@@ -27,6 +27,30 @@ BOOMCO_PLUGIN = HERMES_DATA / "plugins" / "boomco-x" / "__init__.py"
 BOOMCO_QUEUE_STATE = HERMES_DATA / "state" / "boomco-x-queue.json"
 TOSS_PROXY_BASE = "http://100.116.65.86:8092"
 
+# 2026-09-10: 붐엘 쪽엔 Hermes 같은 영속 큐가 없어서(메시지 1건=즉시 처리, 여러 링크는
+# 메모리 for-loop만) 크래시 시 "지금 몇 건 처리 중이었는지"를 알 방법이 없었다. 같은
+# 형식(리스트, url/chat_id/status/received_at)으로 macboom 쪽에도 파일로 남겨서
+# ① 로그만으로 큐 상태를 분석 가능하게 하고 ② 재시작 시 미완료 건을 찾아 재개할 수 있게 한다.
+MACBOOM_STATE_DIR = Path(__file__).resolve().parent / "state"
+MACBOOM_QUEUE_STATE = MACBOOM_STATE_DIR / "macboom-boomco-queue.json"
+
+
+def queue_load():
+    try:
+        data = json.loads(MACBOOM_QUEUE_STATE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def queue_save(items):
+    try:
+        MACBOOM_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        MACBOOM_QUEUE_STATE.write_text(
+            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
 MAX_OUTPUT = 6000  # 도구 결과를 모델에 돌려줄 때의 상한 (컨텍스트 낭비 방지)
 
 
@@ -282,6 +306,7 @@ def system_status(llm_base, model_id, api_key="omlx"):
         parts.append("프로세스 조회 실패: %s" % exc)
     busy = hermes_boomco_busy()
     parts.append("Hermes 붐코 큐: %d건" % busy)
+    parts.append("붐엘 붐코 큐: %d건 (/queue로 상세)" % len(queue_load()))
     return _clip("\n".join(parts))
 
 

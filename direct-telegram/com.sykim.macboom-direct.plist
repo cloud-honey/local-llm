@@ -15,6 +15,20 @@
     <key>WorkingDirectory</key>
     <string>/Users/sykim/Claude_works/local-llm/direct-telegram</string>
 
+    <!-- 2026-09-10: boomco_analyzer.py/series_detector.py의 /v1/models data[0] 자동선택이
+         깨진 실험 모델(Uncensored-100K-MTP, VLM 로드 실패)을 집어서 붐코 파이프라인이 409로
+         전부 실패하던 문제 대응 — 안정 모델로 명시 고정. (BOOMCO_SERIES_MODEL은 처음 조치 때
+         빠뜨렸다가 series_detector.py도 같은 패턴 쓰는 걸 실측으로 재확인 후 추가) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BOOMCO_TEXT_MODEL</key>
+        <string>Qwen3.8-Flash-Next-oQ4e-128k</string>
+        <key>BOOMCO_CRITIC_MODEL</key>
+        <string>Qwen3.8-Flash-Next-oQ4e-128k</string>
+        <key>BOOMCO_SERIES_MODEL</key>
+        <string>Qwen3.8-Flash-Next-oQ4e-128k</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
