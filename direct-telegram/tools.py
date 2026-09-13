@@ -14,8 +14,10 @@ import importlib.util
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -26,30 +28,6 @@ HERMES_DATA = Path("/Users/sykim/Claude_works/hermes-agent/data")
 BOOMCO_PLUGIN = HERMES_DATA / "plugins" / "boomco-x" / "__init__.py"
 BOOMCO_QUEUE_STATE = HERMES_DATA / "state" / "boomco-x-queue.json"
 TOSS_PROXY_BASE = "http://100.116.65.86:8092"
-
-# 2026-09-10: 붐엘 쪽엔 Hermes 같은 영속 큐가 없어서(메시지 1건=즉시 처리, 여러 링크는
-# 메모리 for-loop만) 크래시 시 "지금 몇 건 처리 중이었는지"를 알 방법이 없었다. 같은
-# 형식(리스트, url/chat_id/status/received_at)으로 macboom 쪽에도 파일로 남겨서
-# ① 로그만으로 큐 상태를 분석 가능하게 하고 ② 재시작 시 미완료 건을 찾아 재개할 수 있게 한다.
-MACBOOM_STATE_DIR = Path(__file__).resolve().parent / "state"
-MACBOOM_QUEUE_STATE = MACBOOM_STATE_DIR / "macboom-boomco-queue.json"
-
-
-def queue_load():
-    try:
-        data = json.loads(MACBOOM_QUEUE_STATE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def queue_save(items):
-    try:
-        MACBOOM_STATE_DIR.mkdir(parents=True, exist_ok=True)
-        MACBOOM_QUEUE_STATE.write_text(
-            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
 
 MAX_OUTPUT = 6000  # 도구 결과를 모델에 돌려줄 때의 상한 (컨텍스트 낭비 방지)
 
@@ -180,24 +158,55 @@ def _toss_get(path, params=None):
 # ---------------------------------------------------------------- 셸 / 파이썬 / 파일
 
 
-def run_shell(command, workdir, timeout=180):
+def _killpg(proc):
     try:
-        proc = subprocess.run(["/bin/zsh", "-lc", command], cwd=workdir, capture_output=True,
-                              text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return "시간 초과(%ds)로 중단됨. 명령: %s" % (timeout, command)
-    out = (proc.stdout or "") + (proc.stderr or "")
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _run_proc(argv, workdir, timeout, cancel=None):
+    """서브프로세스를 새 세션으로 띄우고 0.5초마다 /stop(cancel 이벤트)·타임아웃을 확인한다.
+
+    2026-09-13: 예전 subprocess.run 은 끝날 때까지 블로킹이라 `sleep 25` 같은 명령 중엔
+    /stop 이 먹지 않았다. 새 프로세스 그룹으로 띄워 취소 시 자식까지 통째로 죽인다.
+    """
+    try:
+        proc = subprocess.Popen(argv, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, start_new_session=True)
+    except Exception as exc:
+        return "실행 실패: %s: %s" % (type(exc).__name__, exc)
+    box = {}
+
+    def reader():
+        box["out"] = proc.communicate()[0]
+
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+    deadline = time.time() + timeout
+    while th.is_alive():
+        th.join(0.5)
+        if cancel is not None and cancel.is_set():
+            _killpg(proc)
+            th.join(5)
+            return "마스터가 /stop 으로 중단함 — 프로세스를 종료했습니다."
+        if time.time() > deadline:
+            _killpg(proc)
+            th.join(5)
+            return "시간 초과(%ds)로 중단됨. 명령: %s" % (timeout, " ".join(argv)[:200])
+    out = box.get("out") or ""
     return "exit=%d\n%s" % (proc.returncode, _clip(out.strip()) or "(출력 없음)")
 
 
-def run_python(code, workdir, timeout=180):
-    try:
-        proc = subprocess.run([sys.executable, "-c", code], cwd=workdir, capture_output=True,
-                              text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return "시간 초과(%ds)로 중단됨." % timeout
-    out = (proc.stdout or "") + (proc.stderr or "")
-    return "exit=%d\n%s" % (proc.returncode, _clip(out.strip()) or "(출력 없음)")
+def run_shell(command, workdir, timeout=180, cancel=None):
+    return _run_proc(["/bin/zsh", "-lc", command], workdir, timeout, cancel)
+
+
+def run_python(code, workdir, timeout=180, cancel=None):
+    return _run_proc([sys.executable, "-c", code], workdir, timeout, cancel)
 
 
 def read_file(path, offset=0, limit=400):
@@ -285,7 +294,7 @@ def web_fetch(url, max_chars=5000):
     return _clip(text.strip(), int(max_chars or 5000))
 
 
-def system_status(llm_base, model_id, api_key="omlx"):
+def system_status(llm_base, model_id, api_key="omlx", queue_note=""):
     """현재 상태 보고용 — 로컬 모델/게이트웨이/봇 프로세스 실태."""
     parts = []
     t0 = time.time()
@@ -306,7 +315,8 @@ def system_status(llm_base, model_id, api_key="omlx"):
         parts.append("프로세스 조회 실패: %s" % exc)
     busy = hermes_boomco_busy()
     parts.append("Hermes 붐코 큐: %d건" % busy)
-    parts.append("붐엘 붐코 큐: %d건 (/queue로 상세)" % len(queue_load()))
+    if queue_note:
+        parts.append(queue_note + " (/queue 로 상세)")
     return _clip("\n".join(parts))
 
 

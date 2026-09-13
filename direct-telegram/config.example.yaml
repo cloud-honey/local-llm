@@ -17,7 +17,7 @@ llm:
   api_key: "omlx"
   # medium은 대화가 길어질수록 응답이 기하급수적으로 느려진다(실측 342초). low 유지 권장.
   reasoning_effort: "low"
-  max_tokens: 4000
+  max_tokens: 8000
   temperature: 0.4
   request_timeout: 900
 
@@ -27,14 +27,25 @@ workdir: "~/Claude_works"
 
 agent:
   persona_name: "붐엘"        # 이 채널에서 쓰는 이름 (영혼은 맥붐 SOUL.md 그대로)
-  max_tool_steps: 8          # 한 요청에서 허용할 도구 왕복 횟수
+  max_tool_steps: 40         # 한 요청에서 허용할 도구 왕복 횟수 (한도 시 정리 보고, /set steps N)
   history_max_chars: 40000   # 넘으면 오래된 '턴' 단위로 통째로 버림
   show_tool_progress: true   # 도구 실행 상황을 텔레그램에 한 줄로 표시
   auto_boomco_on_x_link: true  # X 링크만 있는 메시지는 바로 붐코 파이프라인 (Hermes 훅과 동일)
 
 safety:
+  # 승인은 "되돌릴 수 없는 파괴"에만 (재귀/강제 삭제, 강제 push, 시스템 파괴, 핵심 서비스 종료,
+  # 비밀정보 접근, 붐엘 자신의 코드/SOUL.md 수정). 기본값은 macboom_direct.py 참고.
   approval_timeout: 300      # 승인 대기 시간(초). 넘으면 자동 거부.
-  # 아래 3개는 비워두면 macboom_direct.py의 기본값이 쓰인다. 필요할 때만 덮어쓸 것.
-  # danger_patterns: []      # 이 정규식에 걸리는 셸/파이썬은 텔레그램 승인 필요
-  # protected_paths: []      # 읽기/쓰기에 승인이 필요한 경로(비밀정보·시스템 설정)
-  # write_roots: []          # 승인 없이 쓸 수 있는 루트. 이 밖은 승인 필요.
+  # danger_patterns: []        # 기본 목록을 통째로 교체
+  # extra_danger_patterns: []  # 기본 목록에 추가
+  # secret_paths: []           # 읽기/쓰기 모두 승인
+  # write_protected: []        # 쓰기만 승인
+  # write_roots: []            # 승인 없이 쓸 수 있는 루트 (기본 ~, /tmp)
+
+memory:
+  # 2026-09-14 장기 기억 (memory.py). 세 층 모두 시스템 프롬프트에 붙는다.
+  auto_summary: true          # 대화 기록이 상한을 넘어 잘리거나 /new 할 때 로컬 모델로 요약해 state/memory-<chat>.md 에 누적
+  max_chars: 6000             # 요약 기억 파일 상한. 넘으면 모델로 한 번 더 압축
+  notes_dir: "~/Claude_works/boomel-notes"   # 프로젝트 노트 (note_list/read/write/append 도구, 사람이 직접 고쳐도 됨)
+  hermes_shared: false        # Hermes(맥붐)의 memories/MEMORY.md·USER.md 읽기 공유. 2026-09-14 마스터 지시로 off — 켜도 별도 블록으로만 표시
+  hermes_max_chars: 5000

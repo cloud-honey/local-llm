@@ -10,16 +10,37 @@
   - 영혼: hermes-agent/data/SOUL.md 를 같은 파일 그대로 읽는다(수정하면 /soul 로 리로드).
   - 파이프라인: 붐코 X 분석은 Hermes 플러그인 모듈을 import 해서 같은 코드로 돌린다.
   - 두뇌: oMLX(127.0.0.1:8766) OpenAI 호환 API에 직접 요청. 모델명은 하드코딩하지 않고
-    매번 /v1/models 로 조회(30초 캐싱) — proxy.mjs 와 같은 방식.
+    서버의 default_model 을 따른다(30초 캐싱).
   - 실행: 시스템 파이썬 3.9(/usr/bin/python3). Hermes venv 의존성 없음.
+
+2026-09-13 구조 변경 (스투시 재고 모니터 작업에서 드러난 문제 대응):
+  - **폴링 스레드와 작업 스레드 분리.** 예전엔 한 스레드가 폴링과 에이전트 실행을 같이
+    했기 때문에 작업 중(수 분~수십 분)에는 /status 같은 명령이 작업이 끝날 때까지 답을
+    못 받았다. 이제 메인 스레드는 폴링·명령·승인 응답만 처리하고, 일반 요청과 붐코 분석은
+    디스크 큐(state/task-queue.json)에 적재된 뒤 워커 스레드가 순차 처리한다.
+    → 작업 중에도 /status 로 "몇 단계째, 무슨 도구를 돌리는지" 보이고 /stop 으로 끊는다.
+  - **도구 반복 한도는 '중단'이 아니라 '정리 보고'.** 8단계에서 뚝 끊고 "요청을 나눠서
+    다시 시켜라"고 하던 걸, 기본 40단계로 늘리고 한도에 닿으면 모델에게 도구 없이 한 번 더
+    물어 "여기까지 했고 이게 남았다"를 보고하게 한다. /set steps N 으로 런타임 조정.
+  - **승인은 파괴적 작업에만.** launchctl·chmod·mv·~/Library/LaunchAgents 쓰기·
+    ~/Claude_works 밖 쓰기 같은 일상 작업이 전부 승인을 요구해 흐름을 끊었다. 이제
+    재귀/강제 삭제·강제 push·디스크/시스템 파괴·핵심 서비스 종료·비밀정보 접근·
+    붐엘 자신의 코드/영혼 수정만 승인 대상이다(Safety 클래스 주석 참고).
+  - **진행 표시는 사람이 읽는 한 줄.** "run_shell {"command": "cd ~ && python3 - <<'PY'\\n..."
+    같은 JSON 원문 대신 "🔧 3/40 run_shell · cd ~/stock-monitor && python3 - <<'PY' (+12줄)".
+  - **텔레그램 '/' 메뉴 등록(setMyCommands).** /status /stop /queue /log /set /restart 등.
 """
 import json
 import os
+import queue
 import re
+import shlex
+import signal
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -27,10 +48,12 @@ import requests
 import yaml
 
 import tools as T
+from memory import Memory
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / "state"
 LOG_PREFIX = "[macboom-direct]"
+LOG_PATH = BASE_DIR / "bot.out.log"
 
 
 def log(*parts):
@@ -56,7 +79,6 @@ def load_config():
 # ------------------------------------------------------------------ 텔레그램
 
 
-
 _MD_CODEBLOCK = re.compile(r"```(?:[\w+-]*)\n?(.*?)```", re.S)
 _MD_INLINE = re.compile(r"`([^`\n]+)`")
 _MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
@@ -76,12 +98,30 @@ def md_to_html(text):
     return out
 
 
+# 텔레그램 '/' 메뉴에 뜨는 목록 (setMyCommands). 설명은 256자 이내.
+BOT_COMMANDS = [
+    ("status", "붐엘 상태 — 작업 중인지·몇 단계째·대기열·로컬 모델"),
+    ("stop", "진행 중인 작업 중단 (/stop all: 대기열까지 비움)"),
+    ("queue", "대기열 보기 (일반 요청·X 링크)"),
+    ("log", "최근 도구 실행 로그 (/log 30)"),
+    ("set", "런타임 설정 보기/변경 (steps·effort·tokens·progress)"),
+    ("new", "대화 기록 초기화"),
+    ("model", "현재 로컬 모델"),
+    ("soul", "SOUL.md 다시 읽기"),
+    ("memory", "자동 요약 기억 보기 (/memory clear: 비우기)"),
+    ("notes", "프로젝트 노트 목록 (~/Claude_works/boomel-notes)"),
+    ("restart", "붐엘 프로세스 재시작 (코드 반영, launchd가 다시 띄움)"),
+    ("help", "도움말"),
+]
+
+
 class Telegram(object):
     def __init__(self, cfg):
         tg = cfg.get("telegram") or {}
         base = (tg.get("api_base") or "http://127.0.0.1:8081").rstrip("/")
         self.url = "%s/bot%s" % (base, tg["token"])
         self.session = requests.Session()
+        self._last_edit = {}  # message_id -> 마지막으로 보낸 텍스트 ("not modified" 오류 회피)
 
     def _post(self, method, payload=None, files=None, timeout=60):
         try:
@@ -101,6 +141,10 @@ class Telegram(object):
         if offset is not None:
             payload["offset"] = offset
         return self._post("getUpdates", payload, timeout=timeout + 20) or []
+
+    def set_my_commands(self, commands):
+        return self._post("setMyCommands", {
+            "commands": [{"command": c, "description": d[:256]} for c, d in commands]})
 
     def send(self, chat_id, text, reply_markup=None, rich=True):
         """4096자 제한을 고려해 3900자씩 잘라 보낸다. 마지막 메시지 id 반환.
@@ -129,8 +173,12 @@ class Telegram(object):
     def edit(self, chat_id, message_id, text):
         if not message_id:
             return
+        text = text[:3900]
+        if self._last_edit.get(message_id) == text:
+            return
+        self._last_edit[message_id] = text
         self._post("editMessageText", {"chat_id": chat_id, "message_id": message_id,
-                                       "text": text[:3900], "disable_web_page_preview": True})
+                                       "text": text, "disable_web_page_preview": True})
 
     def typing(self, chat_id):
         self._post("sendChatAction", {"chat_id": chat_id, "action": "typing"})
@@ -155,27 +203,17 @@ OFFSET_STATE_PATH = STATE_DIR / "telegram-offset.json"
 
 
 class Stream(object):
-    """업데이트 스트림 — 일반 메시지 큐와 승인 콜백을 한 폴링 루프에서 나눠 담는다.
+    """getUpdates 폴링 + offset 영속화.
 
-    2026-09-10: offset을 메모리에만 들고 있으면 프로세스 재시작(예: plist 수정 후
-    bootout+bootstrap) 때마다 Telegram이 "아직 확인 안 된" 업데이트를 다시 보내서
-    직전에 받은 메시지가 중복 recv 되는 게 실측으로 확인됨(elder_plinius 링크가 재시작
-    직후 다시 recv 로그에 찍힘) — 유실은 아니고 중복 재처리(붐코 쪽 409 백엔드가 중복
-    저장은 막아줌)라 무해하지만 낭비. **다만 offset을 fetch 시점에 바로 영속화하면
-    반대 방향 버그(진짜 유실)가 생긴다**: fetch 직후 ~ handle_message 완료 전 사이에
-    크래시하면 그 메시지는 이미 "확인됨" 처리돼 Telegram이 재전송을 안 해준다 —
-    이 봇이 지금 우선순위로 두는 건 "중복 없음"이 아니라 "유실 없음"이므로, 디스크에는
-    **처리가 실제로 끝난 메시지까지만** 반영한다(`ack`). 메모리상의 `self.offset`은
-    기존과 동일하게 fetch 시점에 즉시 전진(같은 폴링 세션 안에서 중복 fetch 방지용).
+    2026-09-10: offset을 메모리에만 들고 있으면 재시작 때 직전 메시지가 중복 recv 되고,
+    반대로 fetch 즉시 디스크에 쓰면 처리 전에 죽은 메시지가 진짜 유실된다. 그래서 디스크
+    offset은 **처리가 끝난(= 명령을 실행했거나 디스크 큐에 적재한) 업데이트까지만**
+    전진시킨다(`ack`). 메모리상 `self.offset`은 fetch 즉시 전진(같은 세션 안 중복 방지).
     """
 
     def __init__(self, api):
         self.api = api
         self.offset = self._load_offset()
-        self.messages = []
-        self.callbacks = {}
-        self.texts = []  # 승인 대기 중 도착한 텍스트(예/아니오 판정용)
-        self._pending_ack = None  # 아직 디스크에 반영 안 된, fetch만 된 update_id 중 최댓값
 
     @staticmethod
     def _load_offset():
@@ -185,48 +223,16 @@ class Stream(object):
             return None
 
     def ack(self, update_id):
-        """update_id에 해당하는 메시지 처리가 실제로 끝난 뒤에만 호출 — 디스크 offset 전진."""
         try:
-            OFFSET_STATE_PATH.write_text(
-                json.dumps({"offset": update_id + 1}), encoding="utf-8")
+            OFFSET_STATE_PATH.write_text(json.dumps({"offset": update_id + 1}), encoding="utf-8")
         except Exception as exc:
             log("offset 저장 실패:", exc)
 
-    def _pump(self, timeout):
-        for upd in self.api.get_updates(self.offset, timeout):
+    def poll(self, timeout=30):
+        updates = self.api.get_updates(self.offset, timeout)
+        for upd in updates:
             self.offset = upd["update_id"] + 1
-            if "callback_query" in upd:
-                cq = upd["callback_query"]
-                self.callbacks[cq.get("data", "")] = cq
-            elif "message" in upd:
-                upd["message"]["_update_id"] = upd["update_id"]
-                self.messages.append(upd["message"])
-
-    def next_message(self, timeout=30):
-        while not self.messages:
-            self._pump(timeout)
-        return self.messages.pop(0)
-
-    def wait_approval(self, token, chat_id, timeout):
-        """버튼 콜백 또는 '응/아니' 같은 텍스트 답장으로 승인 여부를 받는다."""
-        deadline = time.time() + timeout
-        yes = ("y", "yes", "ok", "ㅇ", "ㅇㅇ", "응", "네", "승인", "실행", "해", "해줘", "고")
-        no = ("n", "no", "ㄴ", "ㄴㄴ", "아니", "아니오", "거부", "취소", "하지마", "stop")
-        while time.time() < deadline:
-            for key in list(self.callbacks):
-                if key.startswith(token):
-                    cq = self.callbacks.pop(key)
-                    self.api.answer_callback(cq.get("id"), "확인")
-                    return key.endswith(":y")
-            for msg in list(self.messages):
-                if str(msg.get("chat", {}).get("id")) != str(chat_id):
-                    continue
-                body = (msg.get("text") or "").strip().lower()
-                if body in yes or body in no:
-                    self.messages.remove(msg)
-                    return body in yes
-            self._pump(3)
-        return None  # 시간 초과
+        return updates
 
 
 # ------------------------------------------------------------------ 로컬 LLM
@@ -238,7 +244,7 @@ class LocalLLM(object):
         self.base = (llm.get("base_url") or "http://127.0.0.1:8766/v1").rstrip("/")
         self.key = llm.get("api_key") or "omlx"
         self.reasoning_effort = llm.get("reasoning_effort") or "low"
-        self.max_tokens = int(llm.get("max_tokens") or 4000)
+        self.max_tokens = int(llm.get("max_tokens") or 8000)
         self.temperature = float(llm.get("temperature") or 0.4)
         self.timeout = int(llm.get("request_timeout") or 900)
         # config 의 llm.model 을 채우면 그 모델로 고정한다 (교체 시험 중 고정용).
@@ -280,7 +286,7 @@ class LocalLLM(object):
         self._model_at = time.time()
         return self._model
 
-    def complete(self, messages, tool_schemas=None):
+    def complete(self, messages, tool_schemas=None, tool_choice="auto"):
         body = {
             "model": self.model(),
             "messages": messages,
@@ -290,9 +296,9 @@ class LocalLLM(object):
             # 느려진다(47K 토큰 세션에서 인사말 342초). low가 사실상 필수.
             "reasoning_effort": self.reasoning_effort,
         }
-        if tool_schemas:
+        if tool_schemas and tool_choice != "none":
             body["tools"] = tool_schemas
-            body["tool_choice"] = "auto"
+            body["tool_choice"] = tool_choice
         resp = self.session.post(self.base + "/chat/completions", headers=self.headers,
                                  data=json.dumps(body).encode("utf-8"), timeout=self.timeout)
         if resp.status_code >= 400:
@@ -301,50 +307,131 @@ class LocalLLM(object):
 
 
 # ------------------------------------------------------------------ 안전장치
+#
+# 2026-09-13 원칙 변경: "위험해 보이는 것"이 아니라 **"되돌릴 수 없는 파괴"** 만 승인 대상.
+#   승인 필요  — 재귀/강제/와일드카드 삭제(임시 디렉터리 밖), 강제 push·hard reset 류,
+#               디스크·시스템 파괴(dd/diskutil/shutdown), 원격 스크립트 파이프 실행,
+#               붐엘·Hermes·oMLX·telegram-bot-api 등 핵심 서비스 종료, 비밀정보 읽기/쓰기,
+#               붐엘 자신의 코드·영혼(SOUL.md)·핵심 plist 수정(자기 파괴 방지).
+#   승인 불필요 — 그 밖의 모든 셸/파이썬/파일 작업: launchctl load/kickstart, chmod, mv,
+#               홈 디렉터리 어디든 쓰기(~/Library/LaunchAgents 포함), 단순 rm(임시 디렉터리 안).
+# config.yaml `safety.danger_patterns`는 목록을 통째로 교체, `extra_danger_patterns`는 추가.
 
+_CRIT = r"(hermes|omlx|macboom|telegram-bot-api|llama-server|llama-canary|boom-steward|local-llm-mcp)"
+_SEG = r"[^\n;&|]*"  # 같은 셸 세그먼트 안
 
 DEFAULT_DANGER = [
-    r"\brm\s+-[a-z]*[rf]", r"\brm\s+", r"\bsudo\b", r"\bgit\s+push\b",
-    r"\bgit\s+reset\s+--hard\b", r"\bgit\s+clean\b", r"\bmv\s+", r"\bchmod\b", r"\bchown\b",
-    r"\b(kill|killall|pkill)\b", r"\blaunchctl\b", r"\bdiskutil\b", r"\bdd\s+if=",
-    r"\b(shutdown|reboot)\b", r"\bbrew\s+(uninstall|remove)\b", r"\bnpm\s+publish\b",
-    r"\bpip3?\s+uninstall\b", r"curl[^|]*\|\s*(ba|z)?sh", r"\bdefaults\s+write\b",
-    r"\bcrontab\b", r"\bshutil\.rmtree\b", r"\bos\.(remove|unlink|rmdir)\b", r"\btruncate\b",
+    r"\bsudo\b",
+    r"\bgit\s+push\b" + _SEG + r"(\s--force\b|\s--force-with-lease\b|\s-f\b|\s--delete\b|\s\+\S)",
+    r"\bgit\s+(reset\s+--hard|clean\s+-[a-z]*[fd]|checkout\s+--\s|restore\s+\.|branch\s+-D|stash\s+(drop|clear))\b",
+    r"\bfind\b" + _SEG + r"\s-delete\b",
+    r"\bxargs\b" + _SEG + r"\brm\b",
+    r"\b(diskutil\s+(erase\w*|partition\w*|reformat|zero\w*|secureErase)|mkfs\w*|newfs\w*)\b",
+    r"\bdd\s+if=",
+    r"\b(shutdown|reboot|halt)\b",
+    r"\b(curl|wget)\b[^|\n]*\|\s*(sudo\s+)?(ba|z)?sh\b",
+    r":\(\)\s*\{\s*:\|:&\s*\};:",
+    r"\bshutil\.rmtree\b", r"\bos\.(remove|unlink|rmdir|removedirs)\b", r"\.unlink\([^)]*\)", r"\.rmdir\([^)]*\)",
+    r"\b(brew\s+(uninstall|remove)|pip3?\s+uninstall|npm\s+(publish|unpublish))\b",
+    r"\bdefaults\s+(write|delete)\b",
+    r"\bcrontab\s+-r\b",
+    r"\bkill\s+(-\S+\s+)*-1\b",
+    r"\b(pkill|killall)\s+(-\S+\s+)*(python3?|Python)\b",
+    r"\b(kill|pkill|killall)\b" + _SEG + r"\b" + _CRIT,
+    r"\blaunchctl\s+(bootout|unload|remove|disable|kill|stop|kickstart\s+-k)\b" + _SEG + _CRIT,
+    r"(>{1,2}|\btee\b|\bsed\s+-i\b|\bcp\b|\bmv\b)" + _SEG + r"(SOUL\.md|\.env\b|auth\.json|secrets\S*\.json|id_rsa|id_ed25519|\.ssh/)",
+    r"(~|\$HOME|/Users/\w+)/\.(ssh|aws|gnupg|config/gcloud)\b",
 ]
 
-DEFAULT_PROTECTED = [
-    "~/Library/LaunchAgents", "~/.ssh", "~/.aws", "~/.config/gcloud",
+# 읽기·쓰기 모두 승인 (비밀정보). 경로 전체 또는 파일명 패턴.
+DEFAULT_SECRET_PATHS = [
+    "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud",
     "~/Claude_works/hermes-agent/data/config.yaml",
     "~/Claude_works/hermes-agent/data/.env",
     "~/Claude_works/hermes-agent/data/auth.json",
-    "~/Claude_works/hermes-agent/data/SOUL.md",
     "~/Claude_works/local-llm/direct-telegram/config.yaml",
     "~/sns-tracker/scripts/.env",
 ]
+SECRET_NAME_PATTERNS = [
+    r"^\.env(\..+)?$", r"^secrets?(\.|-|_).*\.(json|ya?ml|toml)$", r"^secrets?\.(json|ya?ml|toml)$",
+    r"^auth\.json$", r"^credentials(\.|-|_|$).*", r"(^|[_.-])tokens?([_.-]|$)", r"\.pem$",
+    r"^id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$", r"\.(key|p12|pfx)$",
+]
 
-DEFAULT_WRITE_ROOTS = ["~/Claude_works", "~/sns-tracker", "/tmp", "/private/tmp"]
+# 쓰기만 승인 (붐엘 자신·형제 서비스의 생명줄 — 실수로 자기 코드/영혼을 깨는 걸 막는다).
+DEFAULT_WRITE_PROTECTED = [
+    "~/Claude_works/hermes-agent/data/SOUL.md",
+    "~/Claude_works/local-llm/direct-telegram/macboom_direct.py",
+    "~/Claude_works/local-llm/direct-telegram/tools.py",
+    "~/Library/LaunchAgents/com.sykim.macboom-direct.plist",
+    "~/Library/LaunchAgents/ai.hermes.gateway.plist",
+    "~/Library/LaunchAgents/ai.boomco.omlx-server.plist",
+    "~/Library/LaunchAgents/com.sykim.telegram-bot-api.plist",
+]
+
+# 승인 없이 쓸 수 있는 루트. 이 밖(/etc, /Library, /usr 등)은 승인.
+DEFAULT_WRITE_ROOTS = ["~", "/tmp", "/private/tmp"]
+
+# rm 이 승인 없이 지울 수 있는 곳 (임시 디렉터리).
+RM_FREE_ROOTS = ["/tmp", "/private/tmp", "/var/folders", "/private/var/folders"]
+
+
+def _real(path):
+    return os.path.realpath(os.path.expandvars(os.path.expanduser(str(path))))
+
+
+def _under(real, roots):
+    return any(real == r or real.startswith(r + os.sep) for r in roots)
 
 
 class Safety(object):
     def __init__(self, cfg):
         s = cfg.get("safety") or {}
-        self.patterns = [re.compile(p, re.I) for p in (s.get("danger_patterns") or DEFAULT_DANGER)]
-        self.protected = [os.path.realpath(os.path.expanduser(p))
-                          for p in (s.get("protected_paths") or DEFAULT_PROTECTED)]
-        self.write_roots = [os.path.realpath(os.path.expanduser(p))
-                            for p in (s.get("write_roots") or DEFAULT_WRITE_ROOTS)]
+        pats = list(s.get("danger_patterns") or DEFAULT_DANGER) + list(s.get("extra_danger_patterns") or [])
+        self.patterns = [re.compile(p, re.I) for p in pats]
+        self.secret_paths = [_real(p) for p in (s.get("protected_paths") or s.get("secret_paths") or DEFAULT_SECRET_PATHS)]
+        self.secret_names = [re.compile(p, re.I) for p in SECRET_NAME_PATTERNS]
+        self.write_protected = [_real(p) for p in (s.get("write_protected") or DEFAULT_WRITE_PROTECTED)]
+        self.write_roots = [_real(p) for p in (s.get("write_roots") or DEFAULT_WRITE_ROOTS)]
+        self.rm_free_roots = [_real(p) for p in RM_FREE_ROOTS]
         self.approval_timeout = int(s.get("approval_timeout") or 300)
 
-    def _is_protected(self, path):
-        real = os.path.realpath(os.path.expanduser(str(path)))
-        for p in self.protected:
-            if real == p or real.startswith(p + os.sep):
-                return True
-        return False
+    # ---- 경로 판정
+    def is_secret(self, path):
+        real = _real(path)
+        if _under(real, self.secret_paths):
+            return True
+        name = os.path.basename(real)
+        return any(p.search(name) for p in self.secret_names)
 
-    def _in_write_roots(self, path):
-        real = os.path.realpath(os.path.expanduser(str(path)))
-        return any(real == r or real.startswith(r + os.sep) for r in self.write_roots)
+    def is_write_protected(self, path):
+        return _under(_real(path), self.write_protected)
+
+    def in_write_roots(self, path):
+        return _under(_real(path), self.write_roots)
+
+    # ---- rm 판정: 임시 디렉터리 안의 명시적 경로만 자유. 와일드카드·그 밖 경로는 승인.
+    def rm_reason(self, command):
+        for seg in re.split(r"\n|;|&&|\|\||\|", command):
+            seg = seg.strip()
+            if not seg or not re.search(r"(^|\s|/)rm(\s|$)", seg):
+                continue
+            try:
+                toks = shlex.split(seg)
+            except ValueError:
+                toks = seg.split()
+            for i, tok in enumerate(toks):
+                if tok != "rm" and not tok.endswith("/rm"):
+                    continue
+                targets = [t for t in toks[i + 1:] if not t.startswith("-")]
+                if not targets:
+                    return "인수 없는 rm (파이프/xargs 삭제?): %s" % seg[:80]
+                for tgt in targets:
+                    if any(c in tgt for c in "*?[{"):
+                        return "와일드카드 삭제: rm %s" % tgt
+                    if not _under(_real(tgt), self.rm_free_roots):
+                        return "임시 디렉터리 밖 파일 삭제: rm %s" % tgt
+        return ""
 
     def check(self, name, args):
         """(승인 필요 여부, 사유) 반환."""
@@ -353,20 +440,97 @@ class Safety(object):
             for pat in self.patterns:
                 m = pat.search(body)
                 if m:
-                    return True, "위험 패턴 감지: `%s`" % m.group(0).strip()
+                    return True, "파괴적/보호 패턴 감지: `%s`" % m.group(0).strip()[:80]
+            if name == "run_shell":
+                r = self.rm_reason(body)
+                if r:
+                    return True, r
             return False, ""
         if name in ("write_file", "edit_file"):
             path = args.get("path") or ""
-            if self._is_protected(path):
-                return True, "보호 대상 파일 수정: %s" % path
-            if not self._in_write_roots(path):
-                return True, "허용된 작업 루트 밖에 쓰기: %s" % path
+            if self.is_secret(path):
+                return True, "비밀정보 파일 수정: %s" % path
+            if self.is_write_protected(path):
+                return True, "붐엘/Hermes 핵심 파일 수정(자기 파괴 방지): %s" % path
+            if not self.in_write_roots(path):
+                return True, "홈 디렉터리 밖에 쓰기: %s" % path
             return False, ""
         if name in ("read_file", "send_file_to_master"):
-            if self._is_protected(args.get("path") or ""):
+            if self.is_secret(args.get("path") or ""):
                 return True, "비밀정보 포함 가능 경로 접근: %s" % args.get("path")
             return False, ""
         return False, ""
+
+
+# ------------------------------------------------------------------ 디스크 작업 큐
+
+
+TASK_QUEUE_PATH = STATE_DIR / "task-queue.json"
+LEGACY_BOOMCO_QUEUE = STATE_DIR / "macboom-boomco-queue.json"
+
+
+class TaskQueue(object):
+    """받은 요청을 디스크에 먼저 적고 워커가 처리 — 크래시해도 유실 없음, /queue 로 조회.
+
+    엔트리: {id, kind: "chat"|"boomco", chat_id, received_at, status: pending|processing,
+            text(chat) | url(boomco)}
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+
+    def _load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save(self, items):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(str(tmp), str(self.path))
+
+    def all(self):
+        with self.lock:
+            return self._load()
+
+    def add(self, kind, chat_id, **payload):
+        entry = {"id": uuid.uuid4().hex, "kind": kind, "chat_id": str(chat_id),
+                 "received_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "status": "pending"}
+        entry.update(payload)
+        with self.lock:
+            items = self._load()
+            items.append(entry)
+            self._save(items)
+            return entry, len(items)
+
+    def set_status(self, eid, status):
+        with self.lock:
+            items = self._load()
+            for e in items:
+                if e.get("id") == eid:
+                    e["status"] = status
+            self._save(items)
+
+    def remove(self, eid):
+        with self.lock:
+            items = [e for e in self._load() if e.get("id") != eid]
+            self._save(items)
+            return len(items)
+
+    def clear_pending(self):
+        with self.lock:
+            items = self._load()
+            kept = [e for e in items if e.get("status") == "processing"]
+            self._save(kept)
+            return len(items) - len(kept)
+
+
+class Cancelled(Exception):
+    pass
 
 
 # ------------------------------------------------------------------ 봇 본체
@@ -387,18 +551,92 @@ DIRECT_ADDENDUM = """
   크론/칸반/스킬, 음성 전사)은 **이 채널에 없다**. 없는 도구를 썼다고 말하지 말고, 필요하면
   "그 작업은 Hermes 쪽 맥붐에게 시켜야 한다"고 안내한다.
 - GPT 폴백이 없으므로 로컬 모델이 실패하면 실패했다고 그대로 보고한다.
-- 위험한 명령(삭제·이동·push·권한 변경·시스템 설정 등)은 마스터의 텔레그램 승인 버튼을 거친
-  뒤에만 실행된다. 거부되면 우회를 시도하지 말고 다른 방법을 제안한다.
+- **승인은 파괴적 작업에만 걸린다**: 재귀/강제/와일드카드 삭제, 강제 push·hard reset,
+  디스크/시스템 파괴, 핵심 서비스(Hermes·oMLX·텔레그램 API·붐엘 자신) 종료, 비밀정보 접근,
+  붐엘 자신의 코드·SOUL.md 수정. 그 밖의 셸·파이썬·파일 작업(launchctl, chmod, mv,
+  ~/Library/LaunchAgents 나 홈 디렉터리 어디든 쓰기)은 **승인 없이 바로 실행**되니
+  "승인을 기다리겠다"고 말하지 마라. 거부되면 우회하지 말고 다른 방법을 제안한다.
+- 한 요청 안에서 도구를 **{max_steps}번**까지 쓸 수 있다. 긴 작업도 요청을 쪼갤 필요 없이
+  끝까지 진행하라. 한도에 닿으면 시스템이 정리 보고를 요청하니 그때 "한 일 / 확인된 결과 /
+  남은 일"을 정리하면 되고, 마스터가 '이어서 진행해'라고 하면 남은 일부터 재개한다.
+  마스터는 언제든 /stop 으로 작업을 끊을 수 있다.
+- 같은 수정을 두 번 하지 마라. edit_file 이 "일치하는 문자열이 없다"고 하면 read_file 로
+  실제 내용을 확인한 뒤 고친다. 파일을 통째로 다시 쓰기보다 edit_file 로 부분 수정한다.
 - 상태를 물으면 추측하지 말고 `system_status`나 `run_shell`로 실제 확인한 뒤 답한다.
-- 답변은 텔레그램으로 나간다. **굵게**, ## 제목, `코드`, [링크](url) 정도는 그대로 렌더링되지만\n  마크다운 표는 깨지니 쓰지 마라.
+- 답변은 텔레그램으로 나간다. **굵게**, ## 제목, `코드`, [링크](url) 정도는 그대로 렌더링되지만
+  마크다운 표는 깨지니 쓰지 마라.
 - **한국어로 답한다.** 이 채널은 도구 출력이 대부분 영어(셸 로그·README·설정 파일)라
   영어로 끌려가기 쉽다. 무엇을 읽었든 마스터에게 나가는 문장은 한국어로 쓴다.
-  명령어·경로·로그 원문은 그대로 인용하되, 설명은 한국어다.
+  명령어·경로·로그 원문은 그대로 인용하되, 설명은 한국어다. **중국어·한자를 섞지 마라**
+  (코드 주석·문서 포함 — 한국어 문장에 한자 단어가 끼어드는 실수가 실제로 있었다).
 - **사고 과정을 그대로 보내지 마라.** 도구를 여러 번 쓴 뒤에는 생각을 정리한 초안이 아니라
   정리된 결론만 보낸다. 영어로 스스로에게 묻고 답하는 문장이 답변에 섞이면 실패다.
 
 현재 시각: {now} (KST) / 작업 디렉터리: {workdir} / 로컬 모델: {model}
 """
+
+YES_WORDS = ("y", "yes", "ok", "ㅇ", "ㅇㅇ", "응", "네", "승인", "실행", "해", "해줘", "고")
+NO_WORDS = ("n", "no", "ㄴ", "ㄴㄴ", "아니", "아니오", "거부", "취소", "하지마", "stop")
+
+TOOL_ICON = {"run_shell": "🔧", "run_python": "🐍", "read_file": "📖", "write_file": "✍️",
+             "edit_file": "✏️", "list_dir": "📂", "web_fetch": "🌐", "boomco_analyze_x": "🔍",
+             "send_file_to_master": "📎", "system_status": "🩺"}
+
+
+def _short_path(p):
+    p = str(p or "")
+    home = os.path.expanduser("~")
+    return ("~" + p[len(home):]) if p.startswith(home) else p
+
+
+def describe_call(name, args):
+    """진행 표시용 한 줄 — JSON 원문 대신 사람이 읽는 요약."""
+    if name in ("run_shell", "run_python"):
+        body = str(args.get("command") or args.get("code") or "").strip()
+        lines = [ln for ln in body.splitlines() if ln.strip()]
+        first = lines[0].strip() if lines else "(빈 명령)"
+        first = first if len(first) <= 110 else first[:107] + "..."
+        return first + (" (+%d줄)" % (len(lines) - 1) if len(lines) > 1 else "")
+    if name in ("read_file", "list_dir", "send_file_to_master"):
+        return _short_path(args.get("path") or "")
+    if name == "write_file":
+        return "%s (%d바이트)" % (_short_path(args.get("path")), len(str(args.get("content") or "").encode("utf-8")))
+    if name == "edit_file":
+        old = str(args.get("old") or "").strip().splitlines()
+        return "%s (교체: %s)" % (_short_path(args.get("path")), (old[0][:50] if old else "?"))
+    if name == "web_fetch":
+        return str(args.get("url") or "")[:110]
+    if name == "boomco_analyze_x":
+        return str(args.get("url") or "")
+    if name.startswith("toss_"):
+        return json.dumps(args, ensure_ascii=False)[:110]
+    return json.dumps(args, ensure_ascii=False)[:110]
+
+
+def approval_preview(name, args):
+    """승인 요청 본문 — 셸/파이썬은 코드 블록으로, 파일은 경로+크기로."""
+    if name in ("run_shell", "run_python"):
+        body = str(args.get("command") or args.get("code") or "")
+        if len(body) > 1500:
+            body = body[:1500] + "\n...(%d자 생략)" % (len(body) - 1500)
+        return "```\n%s\n```" % body
+    if name == "write_file":
+        return "파일: %s (%d바이트)" % (args.get("path"), len(str(args.get("content") or "").encode("utf-8")))
+    if name == "edit_file":
+        return "파일: %s\n\n교체 전:\n```\n%s\n```\n교체 후:\n```\n%s\n```" % (
+            args.get("path"), str(args.get("old") or "")[:600], str(args.get("new") or "")[:600])
+    return json.dumps(args, ensure_ascii=False)[:1200]
+
+
+def _fmt_dur(sec):
+    sec = int(sec)
+    if sec < 60:
+        return "%d초" % sec
+    if sec < 3600:
+        return "%d분 %d초" % (sec // 60, sec % 60)
+    if sec < 86400:
+        return "%d시간 %d분" % (sec // 3600, (sec % 3600) // 60)
+    return "%d일 %d시간" % (sec // 86400, (sec % 86400) // 3600)
 
 
 class Bot(object):
@@ -414,12 +652,25 @@ class Bot(object):
         self.allowed = set(str(x) for x in ((cfg.get("telegram") or {}).get("allowed_chat_ids") or []))
         agent = cfg.get("agent") or {}
         self.persona = agent.get("persona_name") or "맥붐 다이렉트"
-        self.max_steps = int(agent.get("max_tool_steps") or 8)
+        self.max_steps = int(agent.get("max_tool_steps") or 40)
         self.history_chars = int(agent.get("history_max_chars") or 40000)
         self.show_progress = bool(agent.get("show_tool_progress", True))
         self.auto_boomco = bool(agent.get("auto_boomco_on_x_link", True))
         self._soul_cache = (None, 0.0)
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 작업 스레드 관련
+        self.tasks = TaskQueue(TASK_QUEUE_PATH)
+        self.work = queue.Queue()
+        self.cancel = threading.Event()
+        self.approvals = {}          # token -> {chat_id, event, decision, name}
+        self.approvals_lock = threading.Lock()
+        self.current = None          # 워커가 처리 중인 작업 상태 (dict) 또는 None
+        self.current_lock = threading.Lock()
+        self.history_reset_at = {}   # chat_id -> /new 시각 (작업 중 /new 처리용)
+        self.started_at = time.time()
+        # 장기 기억: 자동 요약 + 프로젝트 노트 + Hermes 기억 읽기 (memory.py)
+        self.memory = Memory(cfg, lambda: self.llm, STATE_DIR, log)
 
     # -------------------------------------------------- 영혼 / 시스템 프롬프트
 
@@ -432,15 +683,18 @@ class Bot(object):
             self._soul_cache = (self.soul_path.read_text(encoding="utf-8"), mtime)
         return self._soul_cache[0]
 
-    def system_prompt(self):
-        names = ", ".join(s["function"]["name"] for s in T.tool_schemas())
+    def tool_schemas(self):
+        return T.tool_schemas() + self.memory.note_tool_schemas()
+
+    def system_prompt(self, chat_id=None):
+        names = ", ".join(s["function"]["name"] for s in self.tool_schemas())
         try:
             model = self.llm.model()
         except Exception as exc:
             model = "(조회 실패: %s)" % exc
         return self.soul() + DIRECT_ADDENDUM.format(
             persona=self.persona, tool_names=names, now=time.strftime("%Y-%m-%d %H:%M"),
-            workdir=self.workdir, model=model)
+            workdir=self.workdir, model=model, max_steps=self.max_steps) + self.memory.prompt_block(chat_id)
 
     # -------------------------------------------------- 대화 기록
 
@@ -457,7 +711,11 @@ class Bot(object):
             return []
 
     def save_history(self, chat_id, turns):
-        """오래된 '턴' 단위로 잘라낸다 — tool 메시지가 짝 잃고 남지 않도록 통째로 버린다."""
+        """오래된 '턴' 단위로 잘라낸다 — tool 메시지가 짝 잃고 남지 않도록 통째로 버린다.
+
+        2026-09-14: 잘려 나가는 턴은 그냥 버리지 않고 memory.digest 로 요약해 기억 파일에 남긴다
+        (워커 스레드에서 동기 실행 — 최종 답변은 이미 보낸 뒤라 마스터가 기다리진 않는다).
+        """
         total = 0
         kept = []
         for turn in reversed(turns):
@@ -467,6 +725,9 @@ class Bot(object):
             kept.insert(0, turn)
             total += size
         self._hist_path(chat_id).write_text(json.dumps(kept, ensure_ascii=False), encoding="utf-8")
+        dropped = turns[:len(turns) - len(kept)]
+        if dropped:
+            self.memory.digest(chat_id, dropped, "기록 상한으로 오래된 대화 정리")
         return kept
 
     # -------------------------------------------------- 도구 실행
@@ -474,10 +735,10 @@ class Bot(object):
     def execute_tool(self, chat_id, name, args):
         if name == "run_shell":
             return T.run_shell(str(args.get("command") or ""), self.workdir,
-                               int(args.get("timeout") or 180))
+                               int(args.get("timeout") or 180), cancel=self.cancel)
         if name == "run_python":
             return T.run_python(str(args.get("code") or ""), self.workdir,
-                                int(args.get("timeout") or 180))
+                                int(args.get("timeout") or 180), cancel=self.cancel)
         if name == "read_file":
             return T.read_file(args.get("path"), args.get("offset") or 0, args.get("limit") or 400)
         if name == "write_file":
@@ -503,24 +764,74 @@ class Bot(object):
         if name == "send_file_to_master":
             return self.api.send_document(chat_id, args.get("path"), str(args.get("caption") or ""))
         if name == "system_status":
-            return T.system_status(self.llm.base, self.llm._model or "(미조회)", self.llm.key)
+            return T.system_status(self.llm.base, self.llm._model or "(미조회)", self.llm.key,
+                                   self._queue_note())
+        if name.startswith("note_"):
+            out = self.memory.run_note_tool(name, args)
+            if out is not None:
+                return out
         return "알 수 없는 도구: %s" % name
+
+    # -------------------------------------------------- 승인 (워커 ↔ 메인 스레드)
 
     def approve(self, chat_id, name, args, reason):
         token = uuid.uuid4().hex[:8]
-        preview = json.dumps(args, ensure_ascii=False)[:1200]
-        text = ("⚠️ 승인 요청\n\n도구: %s\n사유: %s\n\n%s\n\n"
+        ev = threading.Event()
+        with self.approvals_lock:
+            self.approvals[token] = {"chat_id": str(chat_id), "event": ev, "decision": None,
+                                     "name": name, "at": time.time()}
+        text = ("⚠️ 승인 요청 — %s\n사유: %s\n\n%s\n\n"
                 "버튼을 누르거나 '응'/'아니'로 답해주세요. (%d초 후 자동 거부)"
-                % (name, reason, preview, self.safety.approval_timeout))
+                % (name, reason, approval_preview(name, args), self.safety.approval_timeout))
         markup = {"inline_keyboard": [[{"text": "✅ 실행", "callback_data": token + ":y"},
                                        {"text": "⛔️ 취소", "callback_data": token + ":n"}]]}
         self.api.send(chat_id, text, reply_markup=markup)
-        decision = self.stream.wait_approval(token, chat_id, self.safety.approval_timeout)
+        log("approval ask", chat_id, name, reason[:80])
+        deadline = time.time() + self.safety.approval_timeout
+        while time.time() < deadline and not self.cancel.is_set():
+            if ev.wait(1.0):
+                break
+        with self.approvals_lock:
+            rec = self.approvals.pop(token, {})
+        decision = rec.get("decision")
+        if self.cancel.is_set():
+            log("approval cancelled", chat_id, name)
+            return False
         if decision is None:
+            log("approval timeout", chat_id, name)
             self.api.send(chat_id, "⏳ 승인 시간이 지나 자동 거부했습니다.")
             return False
+        log("approval", "yes" if decision else "no", chat_id, name)
         self.api.send(chat_id, "✅ 승인됨 — 실행합니다." if decision else "⛔️ 거부됨.")
         return decision
+
+    def _resolve_approval_token(self, token, decision):
+        with self.approvals_lock:
+            rec = self.approvals.get(token)
+            if rec is None:
+                return False
+            rec["decision"] = decision
+            rec["event"].set()
+            return True
+
+    def _resolve_approval_chat(self, chat_id, decision):
+        """버튼 대신 '응/아니' 텍스트로 답한 경우 — 그 chat 의 가장 오래된 대기 건에 적용."""
+        with self.approvals_lock:
+            cands = [(r["at"], t) for t, r in self.approvals.items()
+                     if r["chat_id"] == str(chat_id) and r["decision"] is None]
+            if not cands:
+                return False
+            token = sorted(cands)[0][1]
+            self.approvals[token]["decision"] = decision
+            self.approvals[token]["event"].set()
+            return True
+
+    def _pending_approval(self, chat_id=None):
+        with self.approvals_lock:
+            for r in self.approvals.values():
+                if r["decision"] is None and (chat_id is None or r["chat_id"] == str(chat_id)):
+                    return r
+        return None
 
     # -------------------------------------------------- 에이전트 루프
 
@@ -528,85 +839,188 @@ class Bot(object):
         while not stop_event.wait(6):
             self.api.typing(chat_id)
 
+    def _check_cancel(self):
+        if self.cancel.is_set():
+            raise Cancelled()
+
+    def _complete_cancellable(self, messages, schemas, tool_choice="auto"):
+        """LLM 호출을 보조 스레드에서 돌리며 1초마다 /stop 을 확인한다.
+
+        requests 는 진행 중인 요청을 끊을 수 없으므로 취소 시 보조 스레드는 버린다 —
+        oMLX 는 그 응답 생성을 끝날 때까지 계속하므로(수 분) 그동안 다음 요청이 느릴 수 있다.
+        """
+        box = {}
+
+        def go():
+            try:
+                box["resp"] = self.llm.complete(messages, schemas, tool_choice)
+            except Exception as exc:  # noqa
+                box["err"] = exc
+
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        while th.is_alive():
+            th.join(1.0)
+            if self.cancel.is_set():
+                raise Cancelled()
+        if "err" in box:
+            raise box["err"]
+        return box["resp"]
+
+    def _set_current(self, **kw):
+        with self.current_lock:
+            if self.current is not None:
+                self.current.update(kw)
+
+    def _progress(self, chat_id, line):
+        if not self.show_progress:
+            return
+        with self.current_lock:
+            status_id = (self.current or {}).get("status_id")
+        if status_id:
+            self.api.edit(chat_id, status_id, line)
+        else:
+            mid = self.api.send(chat_id, line, rich=False)
+            self._set_current(status_id=mid)
+
+    @staticmethod
+    def _parse_args(fn):
+        """모델이 준 인수 JSON 파싱. 키 앞의 '_' 는 떼준다(`_caption` 같은 환각 방지)."""
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            return None
+        if not isinstance(args, dict):
+            return None
+        return dict((str(k).lstrip("_"), v) for k, v in args.items())
+
     def run_agent(self, chat_id, user_text):
+        started = time.time()
         turns = self.load_history(chat_id)
-        messages = [{"role": "system", "content": self.system_prompt()}]
+        messages = [{"role": "system", "content": self.system_prompt(chat_id)}]
         for turn in turns:
             messages.extend(turn)
         this_turn = [{"role": "user", "content": user_text}]
         messages.extend(this_turn)
+        schemas = self.tool_schemas()
+        step = 0
+        tool_count = 0
 
-        status_id = None
-        schemas = T.tool_schemas()
-        for step in range(self.max_steps):
-            stop = threading.Event()
-            th = threading.Thread(target=self._keep_typing, args=(chat_id, stop), daemon=True)
-            th.start()
-            try:
-                resp = self.llm.complete(messages, schemas)
-            except Exception as exc:
-                stop.set()
-                self.api.send(chat_id, "로컬 모델 호출 실패: %s: %s" % (type(exc).__name__, exc))
-                return
-            finally:
-                stop.set()
+        def finish(text):
+            self.api.send(chat_id, text)
+            # 작업 도중 /new 가 들어왔으면 예전 기록은 버리고 이번 턴만 남긴다.
+            base = [] if self.history_reset_at.get(str(chat_id), 0) > started else turns
+            self.save_history(chat_id, base + [this_turn])
 
-            choice = (resp.get("choices") or [{}])[0]
-            msg = choice.get("message") or {}
-            calls = msg.get("tool_calls") or []
-            assistant = {"role": "assistant", "content": msg.get("content") or ""}
-            if calls:
-                assistant["tool_calls"] = calls
-            messages.append(assistant)
-            this_turn.append(assistant)
-
-            if not calls:
-                final = (msg.get("content") or "").strip()
-                if not final:
-                    # 사고 과정만 쓰다 끝난 경우(메모리에 기록된 Qwen 계열 함정) 그대로 알린다.
-                    reason = (msg.get("reasoning_content") or "").strip()
-                    final = ("(모델이 최종 답변 없이 사고 과정만 반환했습니다. finish_reason=%s)\n\n%s"
-                             % (choice.get("finish_reason"), reason[-1500:]))
-                self.api.send(chat_id, final)
-                self.save_history(chat_id, turns + [this_turn])
-                return
-
-            for call in calls:
-                fn = call.get("function") or {}
-                name = fn.get("name") or "?"
+        try:
+            while step < self.max_steps:
+                self._check_cancel()
+                stop = threading.Event()
+                th = threading.Thread(target=self._keep_typing, args=(chat_id, stop), daemon=True)
+                th.start()
                 try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except Exception:
-                    args = {}
-                if not isinstance(args, dict):
-                    args = {}
+                    resp = self._complete_cancellable(messages, schemas)
+                except Cancelled:
+                    raise
+                except Exception as exc:
+                    self.api.send(chat_id, "로컬 모델 호출 실패: %s: %s" % (type(exc).__name__, exc))
+                    return
+                finally:
+                    stop.set()
 
-                brief = json.dumps(args, ensure_ascii=False)[:180]
-                log("tool", chat_id, name, brief)
-                if self.show_progress:
-                    line = "🔧 %s %s" % (name, brief)
-                    if status_id:
-                        self.api.edit(chat_id, status_id, line)
+                choice = (resp.get("choices") or [{}])[0]
+                msg = choice.get("message") or {}
+                calls = msg.get("tool_calls") or []
+                finish_reason = choice.get("finish_reason")
+                assistant = {"role": "assistant", "content": msg.get("content") or ""}
+                if calls:
+                    assistant["tool_calls"] = calls
+                messages.append(assistant)
+                this_turn.append(assistant)
+
+                if not calls:
+                    final = (msg.get("content") or "").strip()
+                    if not final:
+                        # 사고 과정만 쓰다 끝난 경우(메모리에 기록된 Qwen 계열 함정) 그대로 알린다.
+                        reason = (msg.get("reasoning_content") or "").strip()
+                        final = ("(모델이 최종 답변 없이 사고 과정만 반환했습니다. finish_reason=%s)\n\n%s"
+                                 % (finish_reason, reason[-1500:]))
+                    finish(final)
+                    return
+
+                step += 1
+                for idx, call in enumerate(calls):
+                    fn = call.get("function") or {}
+                    name = fn.get("name") or "?"
+                    call_id = call.get("id") or ("%s-%d" % (name, tool_count))
+                    args = self._parse_args(fn)
+
+                    if self.cancel.is_set():
+                        # 남은 호출엔 결과를 채워야 다음 요청에서 tool_call 짝이 맞는다.
+                        for rest in calls[idx:]:
+                            this_turn.append({"role": "tool", "tool_call_id": rest.get("id") or name,
+                                              "name": (rest.get("function") or {}).get("name") or name,
+                                              "content": "(마스터가 /stop 으로 중단 — 실행 안 함)"})
+                        raise Cancelled()
+
+                    if args is None:
+                        result = ("도구 인수 JSON 을 파싱할 수 없습니다"
+                                  + (" — 출력 토큰 한도(max_tokens=%d)로 잘린 것 같습니다. 파일을 나눠서 쓰거나 "
+                                     "edit_file 로 부분 수정하세요." % self.llm.max_tokens
+                                     if finish_reason == "length" else ". 인수를 올바른 JSON 으로 다시 보내세요."))
+                        log("tool", chat_id, name, "ARGS PARSE FAIL finish=%s" % finish_reason)
                     else:
-                        status_id = self.api.send(chat_id, line)
+                        tool_count += 1
+                        desc = describe_call(name, args)
+                        log("tool", chat_id, name, json.dumps(args, ensure_ascii=False)[:180])
+                        self._set_current(step=step, tool=name, tool_desc=desc, tool_at=time.time())
+                        self._progress(chat_id, "%s %d/%d %s · %s" % (
+                            TOOL_ICON.get(name, "🔧"), step, self.max_steps, name, desc))
 
-                needs, reason = self.safety.check(name, args)
-                if needs and not self.approve(chat_id, name, args, reason):
-                    result = "마스터가 실행을 거부했습니다. 이 방법은 포기하고 다른 방법을 제안하세요."
-                else:
-                    try:
-                        result = self.execute_tool(chat_id, name, args)
-                    except Exception as exc:
-                        result = "도구 실행 예외: %s: %s" % (type(exc).__name__, exc)
+                        needs, reason = self.safety.check(name, args)
+                        if needs and not self.approve(chat_id, name, args, reason):
+                            if self.cancel.is_set():
+                                for rest in calls[idx:]:
+                                    this_turn.append({"role": "tool", "tool_call_id": rest.get("id") or name,
+                                                      "name": (rest.get("function") or {}).get("name") or name,
+                                                      "content": "(마스터가 /stop 으로 중단 — 실행 안 함)"})
+                                raise Cancelled()
+                            result = "마스터가 실행을 거부했습니다. 이 방법은 포기하고 다른 방법을 제안하세요."
+                        else:
+                            try:
+                                result = self.execute_tool(chat_id, name, args)
+                            except Exception as exc:
+                                result = "도구 실행 예외: %s: %s" % (type(exc).__name__, exc)
 
-                tool_msg = {"role": "tool", "tool_call_id": call.get("id") or name,
-                            "name": name, "content": result}
-                messages.append(tool_msg)
-                this_turn.append(tool_msg)
+                    tool_msg = {"role": "tool", "tool_call_id": call_id, "name": name, "content": result}
+                    messages.append(tool_msg)
+                    this_turn.append(tool_msg)
 
-        self.api.send(chat_id, "도구 반복 한도(%d단계)에 도달해 중단했습니다. 요청을 나눠서 다시 시켜주세요."
-                      % self.max_steps)
-        self.save_history(chat_id, turns + [this_turn])
+            # ---- 소프트 한도: 뚝 끊지 않고 정리 보고를 받는다
+            note = ("[시스템] 이번 요청의 도구 사용 한도(%d단계)에 도달했다. 도구를 더 쓰지 말고, "
+                    "지금까지 **한 일 / 확인된 결과 / 남은 일**을 한국어로 정리해 보고하라. "
+                    "남은 일은 마스터가 '이어서 진행해'라고 하면 재개한다." % self.max_steps)
+            messages.append({"role": "user", "content": note})
+            this_turn.append({"role": "user", "content": note})
+            self._progress(chat_id, "⏸ 도구 한도 %d단계 도달 — 정리 보고 작성 중" % self.max_steps)
+            try:
+                resp = self._complete_cancellable(messages, None, tool_choice="none")
+                msg = ((resp.get("choices") or [{}])[0]).get("message") or {}
+                summary = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()[-1500:]
+            except Cancelled:
+                raise
+            except Exception as exc:
+                summary = "(정리 보고 생성 실패: %s: %s)" % (type(exc).__name__, exc)
+            this_turn.append({"role": "assistant", "content": summary})
+            finish("⏸ 도구 한도(%d단계)에 도달해 여기서 멈췄습니다. 계속하려면 '이어서 진행해'라고 보내거나 "
+                   "/set steps N 으로 한도를 올려주세요.\n\n%s" % (self.max_steps, summary))
+        except Cancelled:
+            log("agent cancelled", chat_id, "steps=%d tools=%d" % (step, tool_count))
+            this_turn.append({"role": "assistant",
+                              "content": "(마스터가 /stop 으로 이 작업을 중단시켰다. %d단계·도구 %d회까지 실행됨. "
+                                         "이어서 하려면 어디까지 됐는지 먼저 확인할 것.)" % (step, tool_count)})
+            finish("⛔ 중단했습니다 (%d단계, 도구 %d회 실행 후). 진행 중이던 모델 응답은 서버에서 몇 분 더 "
+                   "생성될 수 있습니다." % (step, tool_count))
 
     # -------------------------------------------------- 명령어
 
@@ -614,25 +1028,138 @@ class Bot(object):
 
 일반 대화/지시를 그대로 보내면 SOUL.md 페르소나로 도구를 써서 처리합니다.
 X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (Hermes와 같은 코드).
+작업 중에도 명령은 바로 답합니다.
 
+/status   붐엘 상태(작업 중인지·몇 단계째·대기열) + 로컬 모델·프로세스
+/stop     진행 중인 작업 중단 (/stop all: 대기열까지 비움)
+/queue    대기열(일반 요청·X 링크)
+/log [n]  최근 도구 실행 로그 n줄 (기본 20)
+/set      런타임 설정 보기 · /set steps 60 · /set effort low · /set tokens 8000 · /set progress off
 /new      대화 기록 초기화
-/status   로컬 모델·프로세스·붐코 큐 실제 상태
-/queue    붐코 대기열(대기중/처리중 링크 목록)
-/soul     SOUL.md 다시 읽기(앞부분 미리보기)
 /model    현재 로드된 모델
+/soul     SOUL.md 다시 읽기(앞부분 미리보기)
+/memory   자동 요약 기억 보기 (/memory clear 로 비우기 — 백업 남김)
+/notes    프로젝트 노트 목록 (~/Claude_works/boomel-notes)
+/restart  붐엘 프로세스 재시작(코드 반영) — 작업 중이면 /restart now
 /id       내 chat id
 /help     이 도움말"""
 
-    def handle_command(self, chat_id, text):
-        cmd = text.split()[0].lower().split("@")[0]
-        if cmd == "/help" or cmd == "/start":
+    def _queue_note(self):
+        items = self.tasks.all()
+        pend = [e for e in items if e.get("status") == "pending"]
+        return "붐엘 대기열: %d건 (일반 %d, X링크 %d)" % (
+            len(pend), sum(1 for e in pend if e.get("kind") == "chat"),
+            sum(1 for e in pend if e.get("kind") == "boomco"))
+
+    def status_text(self):
+        with self.current_lock:
+            cur = dict(self.current) if self.current else None
+        lines = ["🤖 %s 상태" % self.persona]
+        if cur:
+            entry = cur["entry"]
+            elapsed = _fmt_dur(time.time() - cur["started"])
+            if entry.get("kind") == "boomco":
+                lines.append("• 작업 중 (%s): X 링크 붐코 분석\n  %s" % (elapsed, entry.get("url")))
+            else:
+                text = (entry.get("text") or "").replace("\n", " ")
+                lines.append("• 작업 중 (%s): \"%s\"" % (elapsed, text[:80] + ("…" if len(text) > 80 else "")))
+                if cur.get("tool"):
+                    lines.append("  단계 %d/%d · 마지막 도구 %s (%s 전)\n  %s" % (
+                        cur.get("step", 0), self.max_steps, cur["tool"],
+                        _fmt_dur(time.time() - (cur.get("tool_at") or time.time())), cur.get("tool_desc", "")))
+                else:
+                    lines.append("  단계 0/%d · 모델 응답 대기 중" % self.max_steps)
+            pend = self._pending_approval()
+            if pend:
+                lines.append("  ⚠️ 승인 대기 중: %s (%s 전) — 버튼 또는 '응'/'아니'" % (
+                    pend["name"], _fmt_dur(time.time() - pend["at"])))
+            if self.cancel.is_set():
+                lines.append("  ⛔ 중단 요청됨 — 다음 단계 경계에서 멈춥니다")
+        else:
+            lines.append("• 대기 중 (진행 중인 작업 없음)")
+        lines.append("• " + self._queue_note())
+        lines.append("• 설정: steps=%d effort=%s tokens=%d progress=%s" % (
+            self.max_steps, self.llm.reasoning_effort, self.llm.max_tokens, "on" if self.show_progress else "off"))
+        lines.append("• 모델: %s" % (self.llm._model or "(미조회)"))
+        lines.append("• 가동: %s (PID %d)" % (_fmt_dur(time.time() - self.started_at), os.getpid()))
+        return "\n".join(lines)
+
+    def _tail_log(self, n):
+        try:
+            with LOG_PATH.open("rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 64 * 1024))
+                data = fh.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            return "로그 읽기 실패: %s" % exc
+        lines = [ln.replace(LOG_PREFIX + " ", "") for ln in data.splitlines() if ln.strip()]
+        return "\n".join(lines[-n:]) or "(비어 있음)"
+
+    def handle_command(self, chat_id, text, update_id=None):
+        parts = text.split()
+        cmd = parts[0].lower().split("@")[0]
+        arg = parts[1:] if len(parts) > 1 else []
+        if cmd in ("/help", "/start"):
             self.api.send(chat_id, self.HELP.format(persona=self.persona))
-        elif cmd == "/new":
-            self._hist_path(chat_id).unlink(missing_ok=True)
-            self.api.send(chat_id, "대화 기록을 지웠습니다.")
         elif cmd == "/status":
-            self.api.send(chat_id, T.system_status(self.llm.base, self.llm._model or "(미조회)",
-                                                   self.llm.key))
+            body = self.status_text()
+            try:
+                infra = T.system_status(self.llm.base, self.llm._model or "(미조회)", self.llm.key,
+                                        self._queue_note())
+            except Exception as exc:
+                infra = "인프라 조회 실패: %s" % exc
+            self.api.send(chat_id, body + "\n\n— 인프라 —\n" + infra)
+        elif cmd == "/stop":
+            self._cmd_stop(chat_id, bool(arg and arg[0].lower() == "all"))
+        elif cmd == "/queue":
+            items = self.tasks.all()
+            if not items:
+                self.api.send(chat_id, "대기열 비어있음 (처리 중/대기 중인 요청 없음)")
+            else:
+                lines = ["대기열 %d건:" % len(items)]
+                for i, e in enumerate(items, 1):
+                    what = e.get("url") if e.get("kind") == "boomco" else (e.get("text") or "")[:60]
+                    lines.append("%d. [%s·%s] %s (접수 %s)" % (
+                        i, "X링크" if e.get("kind") == "boomco" else "요청", e.get("status"), what,
+                        e.get("received_at")))
+                self.api.send(chat_id, "\n".join(lines))
+        elif cmd == "/log":
+            try:
+                n = max(1, min(int(arg[0]), 200)) if arg else 20
+            except ValueError:
+                n = 20
+            self.api.send(chat_id, "```\n%s\n```" % self._tail_log(n))
+        elif cmd == "/set":
+            self._cmd_set(chat_id, arg)
+        elif cmd == "/new":
+            old = self.load_history(chat_id)
+            self._hist_path(chat_id).unlink(missing_ok=True)
+            self.history_reset_at[str(chat_id)] = time.time()
+            note = ""
+            if old and self.memory.enabled:
+                # 지우기 전에 요약을 기억에 남긴다 (메인 스레드를 막지 않게 백그라운드)
+                self.memory.digest_async(chat_id, old, "/new 로 기록 초기화")
+                note = " 지운 대화 %d턴은 요약해서 기억(/memory)에 남깁니다." % len(old)
+            self.api.send(chat_id, "대화 기록을 지웠습니다." + note + (
+                " (진행 중인 작업이 끝나면 그 턴만 새 기록으로 남습니다)" if self.current else ""))
+        elif cmd == "/memory":
+            if arg and arg[0].lower() == "clear":
+                bak = self.memory.clear_summary(chat_id)
+                self.api.send(chat_id, "기억을 비웠습니다." + (" 백업: %s" % bak if bak else " (원래 비어 있었음)"))
+            else:
+                text = self.memory.load_summary(chat_id)
+                self.api.send(chat_id, ("🧠 자동 요약 기억 (%d자 / 상한 %d)\n\n%s" % (
+                    len(text), self.memory.max_chars, text)) if text else
+                    "🧠 아직 요약 기억이 없습니다. 대화 기록이 상한(%d자)을 넘거나 /new 를 하면 자동으로 쌓입니다."
+                    % self.history_chars)
+        elif cmd == "/notes":
+            rows = self.memory.note_list()
+            if not rows:
+                self.api.send(chat_id, "프로젝트 노트가 아직 없습니다. (%s)" % self.memory.notes_dir)
+            else:
+                self.api.send(chat_id, "📒 프로젝트 노트 %d개 (%s)\n%s" % (
+                    len(rows), self.memory.notes_dir, "\n".join("- %s (갱신 %s): %s" % r for r in rows)))
         elif cmd == "/soul":
             self._soul_cache = (None, 0.0)
             soul = self.soul()
@@ -644,22 +1171,101 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
                 self.api.send(chat_id, "모델 조회 실패: %s" % exc)
         elif cmd == "/id":
             self.api.send(chat_id, "chat id: %s" % chat_id)
-        elif cmd == "/queue":
-            items = T.queue_load()
-            if not items:
-                self.api.send(chat_id, "붐코 대기열 비어있음 (처리 중/대기 중인 링크 없음)")
-            else:
-                lines = ["붐코 대기열 %d건:" % len(items)]
-                for i, e in enumerate(items, 1):
-                    lines.append("%d. [%s] %s (접수 %s)" % (
-                        i, e.get("status"), e.get("url"), e.get("received_at")))
-                self.api.send(chat_id, "\n".join(lines))
+        elif cmd == "/restart":
+            self._cmd_restart(chat_id, bool(arg and arg[0].lower() == "now"), update_id)
         else:
             self.api.send(chat_id, "모르는 명령입니다. /help 참고.")
 
-    # -------------------------------------------------- 메인 루프
+    def _cmd_stop(self, chat_id, clear_all):
+        with self.current_lock:
+            cur = dict(self.current) if self.current else None
+        msgs = []
+        if cur:
+            if cur["entry"].get("kind") == "boomco":
+                msgs.append("붐코 분석 중에는 중단이 지원되지 않습니다 (파이프라인 자체 타임아웃 최대 25분). "
+                            "대기열만 비우려면 /stop all.")
+            else:
+                self.cancel.set()
+                # 승인 대기 중이면 깨워서 거부 처리
+                with self.approvals_lock:
+                    for r in self.approvals.values():
+                        if r["decision"] is None:
+                            r["decision"] = False
+                            r["event"].set()
+                msgs.append("⛔ 중단 요청했습니다 — 실행 중인 도구를 죽이고 다음 단계 경계에서 멈춥니다.")
+                log("stop requested", chat_id)
+        else:
+            msgs.append("진행 중인 작업이 없습니다.")
+        if clear_all:
+            n = self.tasks.clear_pending()
+            # 메모리 큐도 비운다 (워커가 꺼내기 전 항목)
+            drained = 0
+            while True:
+                try:
+                    self.work.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    break
+            msgs.append("대기열 %d건 비움." % n)
+        self.api.send(chat_id, "\n".join(msgs))
 
-    def handle_message(self, msg):
+    def _cmd_set(self, chat_id, arg):
+        cur = ("현재 설정:\n• steps=%d (도구 한도)\n• effort=%s (reasoning_effort)\n• tokens=%d (max_tokens)\n"
+               "• progress=%s (도구 진행 표시)\n\n예: /set steps 60 · /set effort low · /set tokens 8000 · "
+               "/set progress off\n(런타임에만 적용, 재시작하면 config.yaml 값으로 돌아감)"
+               % (self.max_steps, self.llm.reasoning_effort, self.llm.max_tokens,
+                  "on" if self.show_progress else "off"))
+        if len(arg) < 2:
+            self.api.send(chat_id, cur)
+            return
+        key, val = arg[0].lower(), arg[1].lower()
+        try:
+            if key == "steps":
+                self.max_steps = max(1, min(int(val), 500))
+            elif key == "effort":
+                if val not in ("low", "medium", "high"):
+                    raise ValueError("effort 는 low/medium/high")
+                self.llm.reasoning_effort = val
+            elif key == "tokens":
+                self.llm.max_tokens = max(500, min(int(val), 64000))
+            elif key == "progress":
+                self.show_progress = val in ("on", "1", "true", "yes")
+            else:
+                raise ValueError("모르는 키: %s (steps/effort/tokens/progress)" % key)
+        except ValueError as exc:
+            self.api.send(chat_id, "설정 실패: %s" % exc)
+            return
+        log("set", key, val)
+        self.api.send(chat_id, "적용됨: %s=%s" % (key, val))
+
+    def _cmd_restart(self, chat_id, force, update_id):
+        if self.current and not force:
+            self.api.send(chat_id, "작업이 진행 중입니다. /stop 후 다시 하거나, 그래도 재시작하려면 /restart now "
+                                   "(진행 중이던 요청은 재시작 후 '중단됨'으로 안내되고 자동 재개되지 않습니다).")
+            return
+        self.api.send(chat_id, "🔄 재시작합니다 — launchd(KeepAlive)가 몇 초 안에 다시 띄웁니다.")
+        log("restart requested", chat_id, "force=%s" % force)
+        if update_id is not None:
+            self.stream.ack(update_id)  # 재시작 후 /restart 가 다시 배달돼 무한 재시작하지 않게
+        sys.stdout.flush()
+        os._exit(0)
+
+    # -------------------------------------------------- 메인(폴링) 스레드
+
+    def handle_update(self, upd):
+        if "callback_query" in upd:
+            cq = upd["callback_query"]
+            data = cq.get("data") or ""
+            token, _, verdict = data.rpartition(":")
+            if token and self._resolve_approval_token(token, verdict == "y"):
+                self.api.answer_callback(cq.get("id"), "확인")
+            else:
+                self.api.answer_callback(cq.get("id"), "이미 처리됐거나 만료된 요청입니다")
+            return
+        if "message" in upd:
+            self.handle_message(upd["message"], upd.get("update_id"))
+
+    def handle_message(self, msg, update_id=None):
         chat_id = str((msg.get("chat") or {}).get("id"))
         text = (msg.get("text") or msg.get("caption") or "").strip()
         if self.allowed and chat_id not in self.allowed:
@@ -672,128 +1278,158 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
         log("recv", chat_id, text[:120])
 
         if text.startswith("/"):
-            self.handle_command(chat_id, text)
+            self.handle_command(chat_id, text, update_id)
             return
+
+        low = text.lower()
+        if low in YES_WORDS or low in NO_WORDS:
+            if self._resolve_approval_chat(chat_id, low in YES_WORDS):
+                return  # 승인 응답으로 소비
 
         if self.auto_boomco:
             urls = T.extract_x_urls(text)
             if urls:
-                self._enqueue_and_process_boomco(chat_id, urls)
+                self._enqueue_boomco(chat_id, urls)
                 return
 
-        self.run_agent(chat_id, text)
+        entry, total = self.tasks.add("chat", chat_id, text=text)
+        self.work.put(entry)
+        if self.current is not None:
+            self.api.send(chat_id, "⏳ 지금 다른 작업 중 — 대기열 %d번째로 등록했습니다. 차례가 오면 바로 시작합니다. "
+                                   "(/status 로 진행 상황, /stop 으로 현재 작업 중단)" % total)
 
     # ---------------------------------------------- 붐코 큐 (영속화 + 순차 처리)
     #
     # 2026-09-10: 바쁠 때(한 건 분석 중, 3~10분) 링크를 여러 통 따로 보내면 메시지마다
     # "1건 감지"만 찍혀서 "다 접수는 된 건가?"라는 불안을 유발한다는 실사용 피드백으로
-    # 추가. 메모리 for-loop만 쓰던 걸 디스크에 즉시 기록하는 큐로 바꿔서: ①받는 즉시
-    # "대기열에 몇 건째로 등록됐는지" 보여주고 ②크래시해도 재시작 시 이어서 처리하고
-    # ③`/queue`로 언제든 현재 대기 상태를 확인할 수 있게 한다. 처리 자체는 여전히
-    # 완전 순차(단일 스레드 루프) — 동시 처리로 바꾼 게 아니다.
+    # 추가. 받는 즉시 디스크 큐에 기록해 ①"대기열에 몇 건째로 등록됐는지" 보여주고
+    # ②크래시해도 재시작 시 이어서 처리하고 ③/queue 로 언제든 확인할 수 있게 한다.
+    # 2026-09-13: 일반 요청과 같은 TaskQueue/워커로 통합 (처리는 여전히 완전 순차).
 
-    def _enqueue_and_process_boomco(self, chat_id, urls):
-        # id로 식별 (같은 url을 두 번 보내는 경우가 실제로 있었음 — url+chat_id만으로
-        # 매칭하면 중복 건 중 하나를 처리한 뒤 나머지까지 같이 지워버리는 버그가 생김).
-        items = T.queue_load()
-        new_entries = []
+    def _enqueue_boomco(self, chat_id, urls):
+        entries = []
+        total = 0
         for url in urls:
-            entry = {
-                "id": uuid.uuid4().hex, "url": url, "chat_id": chat_id,
-                "received_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "status": "pending",
-            }
-            items.append(entry)
-            new_entries.append(entry)
-        T.queue_save(items)
-        pending_total = sum(1 for e in items if e.get("status") in ("pending", "processing"))
-        log("queue add", len(new_entries), "chat=%s" % chat_id, "pending_total=%d" % pending_total,
+            entry, total = self.tasks.add("boomco", chat_id, url=url)
+            entries.append(entry)
+        log("queue add", len(entries), "chat=%s" % chat_id, "queue_total=%d" % total,
             "urls=%s" % ",".join(urls))
         self.api.send(chat_id, (
             "🔗 X 링크 %d건 접수 (현재 대기열 총 %d건) — 순서대로 분석합니다. "
             "(1건당 보통 3~10분, 완료될 때마다 결과 전송 / 대기 현황은 /queue)"
-        ) % (len(new_entries), pending_total))
-        for entry in new_entries:
-            self._process_one_boomco(entry)
+        ) % (len(entries), total))
+        for entry in entries:
+            self.work.put(entry)
 
     def _process_one_boomco(self, entry):
         eid, url, chat_id = entry.get("id"), entry["url"], entry["chat_id"]
-        items = T.queue_load()
-        for e in items:
-            if e.get("id") == eid:
-                e["status"] = "processing"
-                break
-        T.queue_save(items)
-        remaining = sum(1 for e in items if e.get("status") in ("pending", "processing"))
-        log("queue start", url, "id=%s" % eid, "remaining_incl_self=%d" % remaining)
+        log("queue start", url, "id=%s" % eid)
         started = time.monotonic()
-
         notify = lambda text: self.api.send(chat_id, text)
         try:
             summary, report = T.boomco_analyze(url, chat_id, notify)
         except Exception as exc:
-            import traceback
             traceback.print_exc()
             summary, report = ("예외: %s: %s" % (type(exc).__name__, exc), None)
-
         elapsed = time.monotonic() - started
-        items = T.queue_load()
-        items = [e for e in items if e.get("id") != eid]
-        T.queue_save(items)
-        remaining = sum(1 for e in items if e.get("status") in ("pending", "processing"))
         ok = bool(report)
-        log("queue done", url, "id=%s" % eid, "ok=%s" % ok, "elapsed=%.1fs" % elapsed,
-            "remaining=%d" % remaining)
+        log("queue done", url, "id=%s" % eid, "ok=%s" % ok, "elapsed=%.1fs" % elapsed)
         self.api.send(chat_id, report or ("분석 실패\n%s\n%s" % (url, summary)))
 
-    def _recover_boomco_queue(self):
-        """비정상 종료로 큐 파일에 남은 게 있으면 기동 시 이어서 처리 (유실 방지)."""
-        items = T.queue_load()
+    # ---------------------------------------------- 워커 스레드
+
+    def _worker(self):
+        while True:
+            entry = self.work.get()
+            self.cancel.clear()
+            with self.current_lock:
+                self.current = {"entry": entry, "started": time.time(), "step": 0, "tool": None,
+                                "tool_desc": "", "tool_at": None, "status_id": None}
+            self.tasks.set_status(entry["id"], "processing")
+            try:
+                if entry.get("kind") == "boomco":
+                    self._process_one_boomco(entry)
+                else:
+                    self.run_agent(entry["chat_id"], entry.get("text") or "")
+            except Exception as exc:
+                traceback.print_exc()
+                try:
+                    self.api.send(entry["chat_id"], "처리 중 예외: %s: %s" % (type(exc).__name__, exc))
+                except Exception:
+                    pass
+            finally:
+                self.tasks.remove(entry["id"])
+                with self.current_lock:
+                    self.current = None
+                self.cancel.clear()
+
+    def _recover_queue(self):
+        """비정상 종료로 큐 파일에 남은 게 있으면 기동 시 처리 (유실 방지).
+
+        - 구버전 붐코 큐 파일(macboom-boomco-queue.json)에 남은 건은 새 큐로 옮긴다.
+        - X 링크: pending/processing 모두 다시 돌린다 (백엔드 409 가 중복 저장을 막는다).
+        - 일반 요청: pending 은 그대로 실행, processing(작업 도중 죽음)은 자동 재실행하면
+          파일 수정 등이 두 번 일어날 수 있어 **알리기만 하고 버린다**.
+        """
+        if LEGACY_BOOMCO_QUEUE.exists():
+            try:
+                legacy = json.loads(LEGACY_BOOMCO_QUEUE.read_text(encoding="utf-8"))
+            except Exception:
+                legacy = []
+            for e in legacy if isinstance(legacy, list) else []:
+                if e.get("url"):
+                    self.tasks.add("boomco", e.get("chat_id"), url=e["url"])
+            LEGACY_BOOMCO_QUEUE.unlink()
+            if legacy:
+                log("구 붐코 큐 이관:", len(legacy), "건")
+        items = self.tasks.all()
         if not items:
             return
-        log("큐 복구:", len(items), "건 남아있음 — 이어서 처리")
-        by_chat = {}
+        log("큐 복구:", len(items), "건 남아있음")
         for e in items:
-            by_chat.setdefault(e.get("chat_id"), []).append(e.get("url"))
-        for chat_id, urls in by_chat.items():
-            self.api.send(chat_id, (
-                "⚠️ 재시작 전에 처리하지 못하고 남아있던 X 링크 %d건을 이어서 처리합니다:\n%s"
-            ) % (len(urls), "\n".join(urls)))
-        for e in items:
-            self._process_one_boomco(e)
+            chat_id = e.get("chat_id")
+            if e.get("kind") == "chat" and e.get("status") == "processing":
+                self.tasks.remove(e["id"])
+                self.api.send(chat_id, "⚠️ 재시작 전에 처리 중이던 요청이 중단됐습니다 (자동 재개 안 함):\n\"%s\"\n"
+                                       "필요하면 다시 보내주세요." % (e.get("text") or "")[:200])
+                continue
+            what = e.get("url") if e.get("kind") == "boomco" else "\"%s\"" % (e.get("text") or "")[:80]
+            self.api.send(chat_id, "♻️ 재시작 전 대기열에 남아있던 건을 이어서 처리합니다: %s" % what)
+            self.tasks.set_status(e["id"], "pending")
+            self.work.put(e)
 
     def run(self):
         try:
             me = self.api._post("getMe", {})
         except Exception:
             me = None
-        log("기동. 봇:", (me or {}).get("username") or "(getMe 실패)")
+        log("기동. 봇:", (me or {}).get("username") or "(getMe 실패)", "PID", os.getpid())
         try:
             log("모델:", self.llm.model())
         except Exception as exc:
             log("모델 조회 실패:", exc)
-        self._recover_boomco_queue()
+        if self.api.set_my_commands(BOT_COMMANDS) is not None:
+            log("텔레그램 명령 메뉴 등록:", len(BOT_COMMANDS), "개")
+        self._recover_queue()
+        threading.Thread(target=self._worker, name="worker", daemon=True).start()
         while True:
             try:
-                msg = self.stream.next_message(30)
+                updates = self.stream.poll(30)
             except Exception as exc:
                 log("폴링 오류:", type(exc).__name__, exc)
                 time.sleep(3)
                 continue
-            try:
-                self.handle_message(msg)
-            except Exception as exc:
-                import traceback
-                traceback.print_exc()
-                chat_id = str((msg.get("chat") or {}).get("id"))
-                self.api.send(chat_id, "처리 중 예외: %s: %s" % (type(exc).__name__, exc))
-            finally:
-                # handle_message가 정상/예외 어느 쪽으로든 "끝까지 시도"한 뒤에만 offset을
-                # 디스크에 반영 — 그 전에 프로세스가 죽으면 Telegram이 재전송해주게 둔다
-                # (유실 방지가 중복 방지보다 우선).
-                update_id = msg.get("_update_id")
-                if update_id is not None:
-                    self.stream.ack(update_id)
+            for upd in updates:
+                try:
+                    self.handle_update(upd)
+                except Exception as exc:
+                    traceback.print_exc()
+                    chat_id = str(((upd.get("message") or {}).get("chat") or {}).get("id") or "")
+                    if chat_id:
+                        self.api.send(chat_id, "처리 중 예외: %s: %s" % (type(exc).__name__, exc))
+                finally:
+                    # 명령은 실행됐고 일반 요청은 디스크 큐에 적재됐으므로 여기서 확인 처리.
+                    self.stream.ack(upd["update_id"])
 
 
 def main():
