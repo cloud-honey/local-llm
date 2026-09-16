@@ -190,7 +190,9 @@ def test_safety():
         ("run_shell", {"command": "echo x >> ~/Claude_works/hermes-agent/data/SOUL.md"}, True),
         ("run_shell", {"command": "dd if=/dev/zero of=/dev/disk2"}, True),
         ("run_python", {"code": "import shutil; shutil.rmtree('/tmp/x')"}, True),
-        ("run_python", {"code": "import os; os.remove('a')"}, True),
+        ("run_python", {"code": "import os; os.remove('a')"}, False),
+        ("run_shell", {"command": "python3 - <<'PY'\nfrom pathlib import Path\nPath('/tmp/x').unlink(missing_ok=True)\nPY"}, False),
+        ("run_python", {"code": "import os; os.removedirs('/tmp/a/b')"}, True),
         ("write_file", {"path": "~/Claude_works/hermes-agent/data/config.yaml"}, True),
         ("write_file", {"path": "~/Claude_works/hermes-agent/data/SOUL.md"}, True),
         ("write_file", {"path": "~/Claude_works/local-llm/direct-telegram/macboom_direct.py"}, True),
@@ -403,6 +405,34 @@ def test_bot_flow():
     check("프로젝트 노트 1개" in bot.api.sent[-1], "/notes 목록")
     hermes = bot.memory.hermes_text()
     check(("MEMORY.md" in hermes) or hermes == "", "Hermes 기억 읽기(있으면 표시)")
+
+    # 10) 턴 중간 컨텍스트 압축: 큰 도구 결과가 쌓이면 오래된 것부터 스텁 → 요약
+    bot = make_bot([([_tc("run_shell", {"command": "python3 -c \"print('z'*3000)\""})], ""), (None, "끝")])
+    bot.max_steps = 12
+    bot.compact_chars = 12000
+    bot.compact_keep = 3
+    bot.llm.script = [([_tc("run_shell", {"command": "python3 -c \"print('z'*3000)\""})], "")] * 8 + [(None, "끝")]
+    bot.handle_update(msg("압축 테스트", 40))
+    check(wait_idle(bot, 60), "압축 테스트 완료")
+    hist = json.loads(bot._hist_path("1").read_text())[-1]
+    stubs = [m for m in hist if m.get("_stub")]
+    folded = [m for m in hist if m.get("_folded")]
+    check(stubs or folded, "오래된 도구 결과가 스텁(%d) 또는 요약(%d)으로 접힘" % (len(stubs), len(folded)))
+    check(bot.api.sent[-1] == "끝", "압축 후에도 정상 종료")
+    check(M.Bot._msgs_chars(hist) < 12000 + 4000, "저장된 턴 크기 상한 근처 (%d자)" % M.Bot._msgs_chars(hist))
+
+    # 11) 승인 메시지에 작업 맥락 포함
+    bot = make_bot([([_tc("run_shell", {"command": "sudo ls"})], ""), (None, "완료")])
+    bot.handle_update(msg("루트 권한 확인해줘", 41))
+    time.sleep(0.8)
+    check('작업: "루트 권한 확인해줘"' in bot.api.sent[-1] and "단계 1/" in bot.api.sent[-1], "승인 요청에 작업·단계 표시")
+    bot.handle_update(msg("아니", 42))
+    check(wait_idle(bot), "거부 후 종료")
+
+    # 12) 비 UTF-8 바이트 출력도 결과가 돌아온다
+    import tools as T
+    out = T.run_shell("printf 'ok\\xb0\\xb1 done'", "/tmp", 10)
+    check(out.startswith("exit=0") and "done" in out, "비 UTF-8 출력 처리: %s" % out.replace("\n", " ")[:60])
 
     print("봇 흐름: 실패 %d" % failed)
     return failed

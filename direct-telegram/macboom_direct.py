@@ -331,7 +331,9 @@ DEFAULT_DANGER = [
     r"\b(shutdown|reboot|halt)\b",
     r"\b(curl|wget)\b[^|\n]*\|\s*(sudo\s+)?(ba|z)?sh\b",
     r":\(\)\s*\{\s*:\|:&\s*\};:",
-    r"\bshutil\.rmtree\b", r"\bos\.(remove|unlink|rmdir|removedirs)\b", r"\.unlink\([^)]*\)", r"\.rmdir\([^)]*\)",
+    # 2026-09-16: os.remove/unlink·Path.unlink() 같은 단일 파일 삭제는 제외 — 붐엘이 자기 임시 파일을
+    # 지우는 코드가 밤새 승인 요청→5분 타임아웃을 3번 반복했다. 재귀 삭제(rmtree/removedirs)만 승인.
+    r"\bshutil\.rmtree\b", r"\bos\.removedirs\b",
     r"\b(brew\s+(uninstall|remove)|pip3?\s+uninstall|npm\s+(publish|unpublish))\b",
     r"\bdefaults\s+(write|delete)\b",
     r"\bcrontab\s+-r\b",
@@ -652,7 +654,10 @@ class Bot(object):
         self.allowed = set(str(x) for x in ((cfg.get("telegram") or {}).get("allowed_chat_ids") or []))
         agent = cfg.get("agent") or {}
         self.persona = agent.get("persona_name") or "맥붐 다이렉트"
-        self.max_steps = int(agent.get("max_tool_steps") or 40)
+        self.max_steps = int(agent.get("max_tool_steps") or 120)
+        # 진행 중인 턴이 이 글자 수를 넘으면 오래된 도구 결과를 생략/요약해 컨텍스트를 줄인다 (128K 모델 기준)
+        self.compact_chars = int(agent.get("turn_compact_chars") or 200000)
+        self.compact_keep = int(agent.get("compact_keep_steps") or 10)
         self.history_chars = int(agent.get("history_max_chars") or 40000)
         self.show_progress = bool(agent.get("show_tool_progress", True))
         self.auto_boomco = bool(agent.get("auto_boomco_on_x_link", True))
@@ -780,9 +785,17 @@ class Bot(object):
         with self.approvals_lock:
             self.approvals[token] = {"chat_id": str(chat_id), "event": ev, "decision": None,
                                      "name": name, "at": time.time()}
-        text = ("⚠️ 승인 요청 — %s\n사유: %s\n\n%s\n\n"
-                "버튼을 누르거나 '응'/'아니'로 답해주세요. (%d초 후 자동 거부)"
-                % (name, reason, approval_preview(name, args), self.safety.approval_timeout))
+        with self.current_lock:
+            cur = dict(self.current) if self.current else {}
+        task_text = ((cur.get("entry") or {}).get("text") or "").replace("\n", " ")
+        ctx = ""
+        if task_text:
+            ctx = "작업: \"%s\" (단계 %d/%d, %s 경과)\n" % (
+                task_text[:100] + ("…" if len(task_text) > 100 else ""), cur.get("step", 0), self.max_steps,
+                _fmt_dur(time.time() - cur.get("started", time.time())))
+        text = ("⚠️ 승인 요청 — %s\n%s사유: %s\n\n%s\n\n"
+                "버튼을 누르거나 '응'/'아니'로 답해주세요. (%d초 후 자동 거부 → 붐엘은 다른 방법을 찾거나 멈춤)"
+                % (name, ctx, reason, approval_preview(name, args), self.safety.approval_timeout))
         markup = {"inline_keyboard": [[{"text": "✅ 실행", "callback_data": token + ":y"},
                                        {"text": "⛔️ 취소", "callback_data": token + ":n"}]]}
         self.api.send(chat_id, text, reply_markup=markup)
@@ -894,6 +907,73 @@ class Bot(object):
             return None
         return dict((str(k).lstrip("_"), v) for k, v in args.items())
 
+    # -------------------------------------------------- 턴 중간 컨텍스트 압축
+    #
+    # 2026-09-16: 한 요청 안에서는 도구 호출·결과가 전부 메시지에 쌓이고 정리하는 장치가 없었다.
+    # 도구 결과는 6000자까지라 80단계면 20만 자를 넘겨 128K 컨텍스트에 닿는다(실측: 76단계 70분 통과가
+    # 최대). 그래서 매 LLM 호출 전에 진행 중인 턴 크기를 재고, 상한을 넘으면
+    #   1단계: 최근 compact_keep 단계를 제외한 오래된 도구 결과·큰 도구 인수를 한 줄 스텁으로 교체
+    #   2단계: 그래도 크면 오래된 부분을 로컬 모델로 요약해 assistant 메시지 하나로 접는다
+    # this_turn 과 messages 는 같은 dict 객체를 가리키므로 in-place 수정이 둘 다에 반영되고,
+    # 저장되는 기록도 압축본이 된다.
+
+    @staticmethod
+    def _msgs_chars(msgs):
+        return sum(len(m.get("content") or "") + sum(len((c.get("function") or {}).get("arguments") or "")
+                                                     for c in (m.get("tool_calls") or [])) for m in msgs)
+
+    def _compact_turn(self, chat_id, messages, this_turn):
+        total = self._msgs_chars(messages)
+        if total <= self.compact_chars:
+            return
+        # 도구 호출 단계 경계: assistant(tool_calls) 메시지 인덱스
+        step_idx = [i for i, m in enumerate(this_turn) if m.get("role") == "assistant" and m.get("tool_calls")]
+        if len(step_idx) <= self.compact_keep:
+            return
+        cutoff = step_idx[-self.compact_keep]  # 이 인덱스부터는 그대로 둔다
+        stubbed = 0
+        for m in this_turn[1:cutoff]:
+            if m.get("role") == "tool" and len(m.get("content") or "") > 200 and not m.get("_stub"):
+                m["content"] = "(도구 결과 생략 — 원래 %d자. 필요하면 같은 도구를 다시 실행할 것)" % len(m["content"])
+                m["_stub"] = True
+                stubbed += 1
+            elif m.get("role") == "assistant":
+                for c in m.get("tool_calls") or []:
+                    fn = c.get("function") or {}
+                    a = fn.get("arguments") or ""
+                    if len(a) > 600:
+                        try:
+                            d = json.loads(a)
+                            for k in ("content", "new", "old", "code", "command"):
+                                if isinstance(d.get(k), str) and len(d[k]) > 200:
+                                    d[k] = "(생략 %d자)" % len(d[k])
+                            fn["arguments"] = json.dumps(d, ensure_ascii=False)
+                        except Exception:
+                            fn["arguments"] = a[:200] + "…(생략)"
+                        stubbed += 1
+        after = self._msgs_chars(messages)
+        log("compact stub", chat_id, "%d건 %d→%d자" % (stubbed, total, after))
+        if after <= self.compact_chars:
+            self._progress(chat_id, "🗜 컨텍스트 압축: 오래된 도구 결과 %d건 생략 (%d→%d자)" % (stubbed, total, after))
+            return
+        # 2단계: 오래된 부분을 요약 한 덩어리로
+        old = this_turn[1:cutoff]
+        try:
+            summary = self.memory.summarize_turns([old]) or "(요약 실패 — 앞부분 생략)"
+        except Exception as exc:
+            summary = "(요약 실패: %s — 앞부분 생략)" % exc
+        folded = {"role": "assistant", "content": "[이 요청의 앞부분 %d단계는 컨텍스트 절약을 위해 요약됨]\n%s"
+                  % (len(step_idx) - self.compact_keep, summary), "_folded": True}
+        new_turn = [this_turn[0], folded] + this_turn[cutoff:]
+        # messages 에서도 같은 구간을 교체 (this_turn 은 messages 의 꼬리)
+        head = len(messages) - len(this_turn)
+        messages[head:] = new_turn
+        this_turn[:] = new_turn
+        final = self._msgs_chars(messages)
+        log("compact fold", chat_id, "%d단계 요약 %d→%d자" % (len(step_idx) - self.compact_keep, after, final))
+        self._progress(chat_id, "🗜 컨텍스트 압축: 앞 %d단계를 요약으로 접음 (%d→%d자)" % (
+            len(step_idx) - self.compact_keep, total, final))
+
     def run_agent(self, chat_id, user_text):
         started = time.time()
         turns = self.load_history(chat_id)
@@ -915,6 +995,7 @@ class Bot(object):
         try:
             while step < self.max_steps:
                 self._check_cancel()
+                self._compact_turn(chat_id, messages, this_turn)
                 stop = threading.Event()
                 th = threading.Thread(target=self._keep_typing, args=(chat_id, stop), daemon=True)
                 th.start()
@@ -1221,7 +1302,7 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
         key, val = arg[0].lower(), arg[1].lower()
         try:
             if key == "steps":
-                self.max_steps = max(1, min(int(val), 500))
+                self.max_steps = max(1, min(int(val), 1000))
             elif key == "effort":
                 if val not in ("low", "medium", "high"):
                     raise ValueError("effort 는 low/medium/high")

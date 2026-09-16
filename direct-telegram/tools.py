@@ -175,8 +175,10 @@ def _run_proc(argv, workdir, timeout, cancel=None):
     /stop 이 먹지 않았다. 새 프로세스 그룹으로 띄워 취소 시 자식까지 통째로 죽인다.
     """
     try:
+        # errors="replace": 도구 출력에 UTF-8 이 아닌 바이트(0xb0 등)가 섞이면 reader 스레드가 죽어
+        # 결과가 "(출력 없음)" 으로 돌아가던 사고(9/16 bot.err.log) 방지.
         proc = subprocess.Popen(argv, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, start_new_session=True)
+                                text=True, encoding="utf-8", errors="replace", start_new_session=True)
     except Exception as exc:
         return "실행 실패: %s: %s" % (type(exc).__name__, exc)
     box = {}

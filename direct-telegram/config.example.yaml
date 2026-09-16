@@ -27,7 +27,9 @@ workdir: "~/Claude_works"
 
 agent:
   persona_name: "붐엘"        # 이 채널에서 쓰는 이름 (영혼은 맥붐 SOUL.md 그대로)
-  max_tool_steps: 40         # 한 요청에서 허용할 도구 왕복 횟수 (한도 시 정리 보고, /set steps N)
+  max_tool_steps: 120        # 한 요청에서 허용할 도구 왕복 횟수 (한도 시 정리 보고, /set steps N)
+  turn_compact_chars: 200000 # 진행 중인 턴이 이 글자 수를 넘으면 오래된 도구 결과 생략→요약
+  compact_keep_steps: 10     # 압축 시 그대로 두는 최근 단계 수
   history_max_chars: 40000   # 넘으면 오래된 '턴' 단위로 통째로 버림
   show_tool_progress: true   # 도구 실행 상황을 텔레그램에 한 줄로 표시
   auto_boomco_on_x_link: true  # X 링크만 있는 메시지는 바로 붐코 파이프라인 (Hermes 훅과 동일)
