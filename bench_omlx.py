@@ -42,8 +42,10 @@ def build_prompt(target_tokens, nonce):
     # 한국어는 대략 1.6자/토큰. 바늘(nonce)을 중간에 심어 캐시 우회 + 이해도 확인에 쓴다.
     chars = int(target_tokens * 1.6)
     body = (FILLER * (chars // len(FILLER) + 1))[:chars]
+    # 바늘을 **맨 앞**에 둔다: 중간에 두면 앞 절반이 이전 실행과 같은 접두어라 SSD 프리픽스 캐시에 맞아
+    # "콜드"가 콜드가 아니게 된다 (9/17 실측: 32K 콜드 TTFT 84초→42초로 오염). 맨 앞이 다르면 전부 콜드.
     mid = len(body) // 2
-    body = body[:mid] + " [비밀 코드: %s] " % nonce + body[mid:]
+    body = "[세션 %s] " % nonce + body[:mid] + " [비밀 코드: %s] " % nonce + body[mid:]
     return body + "\n\n위 글 중간에 있는 '비밀 코드'를 그대로 적고, 글의 분위기를 한 문장으로 말해줘."
 
 
