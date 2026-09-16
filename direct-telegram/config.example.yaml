@@ -30,6 +30,8 @@ agent:
   max_tool_steps: 120        # 한 요청에서 허용할 도구 왕복 횟수 (한도 시 정리 보고, /set steps N)
   turn_compact_chars: 200000 # 진행 중인 턴이 이 글자 수를 넘으면 오래된 도구 결과 생략→요약
   compact_keep_steps: 10     # 압축 시 그대로 두는 최근 단계 수
+  plan_step_max_steps: 30    # 계획(plan_create)의 하위 작업 하나에 허용하는 도구 왕복 횟수
+  # soul_skip_sections: []   # SOUL.md 에서 프롬프트에 안 넣을 "## 제목"(부분 일치). 기본: GPT 폴백/무거운 코드 작성/음성·영상 전사/현재 상태 보고
   history_max_chars: 40000   # 넘으면 오래된 '턴' 단위로 통째로 버림
   show_tool_progress: true   # 도구 실행 상황을 텔레그램에 한 줄로 표시
   auto_boomco_on_x_link: true  # X 링크만 있는 메시지는 바로 붐코 파이프라인 (Hermes 훅과 동일)
@@ -47,7 +49,8 @@ safety:
 memory:
   # 2026-09-14 장기 기억 (memory.py). 세 층 모두 시스템 프롬프트에 붙는다.
   auto_summary: true          # 대화 기록이 상한을 넘어 잘리거나 /new 할 때 로컬 모델로 요약해 state/memory-<chat>.md 에 누적
-  max_chars: 6000             # 요약 기억 파일 상한. 넘으면 모델로 한 번 더 압축
+  max_chars: 4000             # 요약 기억 파일 상한. 넘으면 모델로 한 번 더 압축 (끝난 일은 한 줄로)
+  prompt_max_chars: 3500      # 매 요청 프롬프트에 넣는 요약 분량(최신부터)
   notes_dir: "~/Claude_works/boomel-notes"   # 프로젝트 노트 (note_list/read/write/append 도구, 사람이 직접 고쳐도 됨)
   hermes_shared: false        # Hermes(맥붐)의 memories/MEMORY.md·USER.md 읽기 공유. 2026-09-14 마스터 지시로 off — 켜도 별도 블록으로만 표시
   hermes_max_chars: 5000

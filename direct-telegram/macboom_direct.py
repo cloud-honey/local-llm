@@ -108,6 +108,7 @@ BOT_COMMANDS = [
     ("new", "대화 기록 초기화"),
     ("model", "현재 로컬 모델"),
     ("soul", "SOUL.md 다시 읽기"),
+    ("plan", "진행 중/멈춘 계획 현황 (/plan resume 재개 · /plan cancel 취소)"),
     ("memory", "자동 요약 기억 보기 (/memory clear: 비우기)"),
     ("notes", "프로젝트 노트 목록 (~/Claude_works/boomel-notes)"),
     ("restart", "붐엘 프로세스 재시작 (코드 반영, launchd가 다시 띄움)"),
@@ -535,6 +536,22 @@ class Cancelled(Exception):
     pass
 
 
+SOUL_SKIP_DEFAULT = ["GPT 폴백", "무거운 코드 작성", "음성·영상 전사", "현재 상태 보고"]
+
+
+def strip_soul_sections(text, skip):
+    """'## 제목' 단위로 나눠 skip 에 부분 일치하는 섹션을 뺀다."""
+    if not skip:
+        return text
+    out, drop = [], False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            drop = any(k in line for k in skip)
+        if not drop:
+            out.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip() + "\n"
+
+
 # ------------------------------------------------------------------ 봇 본체
 
 
@@ -574,7 +591,12 @@ DIRECT_ADDENDUM = """
 - **사고 과정을 그대로 보내지 마라.** 도구를 여러 번 쓴 뒤에는 생각을 정리한 초안이 아니라
   정리된 결론만 보낸다. 영어로 스스로에게 묻고 답하는 문장이 답변에 섞이면 실패다.
 
-현재 시각: {now} (KST) / 작업 디렉터리: {workdir} / 로컬 모델: {model}
+- **큰 일은 계획으로 쪼개라.** 하위 작업 4개 이상이 예상되거나(여러 파일 수정·서비스 구축·조사+구현),
+  30분 넘게 걸릴 것 같으면 바로 시작하지 말고 `plan_create` 로 3~8개 단계를 정의한다. 각 단계는 새
+  컨텍스트에서 따로 실행되니 제목만 보고 할 수 있게 구체적으로 쓴다. 단순 질문·조회·한두 파일 수정은
+  계획 없이 바로 처리한다. 계획 단계 안에서는 그 단계만 하고 `plan_step_done` 으로 끝낸다.
+
+작업 디렉터리: {workdir} / 로컬 모델: {model} / 메시지 앞의 [날짜 시각]이 그 메시지를 받은 시각(KST)이다.
 """
 
 YES_WORDS = ("y", "yes", "ok", "ㅇ", "ㅇㅇ", "응", "네", "승인", "실행", "해", "해줘", "고")
@@ -658,6 +680,11 @@ class Bot(object):
         # 진행 중인 턴이 이 글자 수를 넘으면 오래된 도구 결과를 생략/요약해 컨텍스트를 줄인다 (128K 모델 기준)
         self.compact_chars = int(agent.get("turn_compact_chars") or 200000)
         self.compact_keep = int(agent.get("compact_keep_steps") or 10)
+        self.plan_step_max_steps = int(agent.get("plan_step_max_steps") or 30)
+        # 붐엘에 없는 기능을 다루는 SOUL.md 섹션(## 제목 부분 일치)은 프롬프트에서 뺀다 — 토큰 40% 절약 +
+        # "delegate_task 를 써라"/"없다"는 모순 제거. 파일 자체는 Hermes 와 공유하므로 건드리지 않는다.
+        self.soul_skip = list(agent.get("soul_skip_sections") or SOUL_SKIP_DEFAULT)
+        self._loop_exit = None
         self.history_chars = int(agent.get("history_max_chars") or 40000)
         self.show_progress = bool(agent.get("show_tool_progress", True))
         self.auto_boomco = bool(agent.get("auto_boomco_on_x_link", True))
@@ -685,11 +712,11 @@ class Bot(object):
         except OSError:
             return "(SOUL.md를 읽을 수 없습니다: %s)" % self.soul_path
         if self._soul_cache[0] is None or self._soul_cache[1] != mtime:
-            self._soul_cache = (self.soul_path.read_text(encoding="utf-8"), mtime)
+            self._soul_cache = (strip_soul_sections(self.soul_path.read_text(encoding="utf-8"), self.soul_skip), mtime)
         return self._soul_cache[0]
 
     def tool_schemas(self):
-        return T.tool_schemas() + self.memory.note_tool_schemas()
+        return T.tool_schemas() + self.memory.note_tool_schemas() + self.plan_tool_schemas()
 
     def system_prompt(self, chat_id=None):
         names = ", ".join(s["function"]["name"] for s in self.tool_schemas())
@@ -698,7 +725,7 @@ class Bot(object):
         except Exception as exc:
             model = "(조회 실패: %s)" % exc
         return self.soul() + DIRECT_ADDENDUM.format(
-            persona=self.persona, tool_names=names, now=time.strftime("%Y-%m-%d %H:%M"),
+            persona=self.persona, tool_names=names,
             workdir=self.workdir, model=model, max_steps=self.max_steps) + self.memory.prompt_block(chat_id)
 
     # -------------------------------------------------- 대화 기록
@@ -773,6 +800,10 @@ class Bot(object):
                                    self._queue_note())
         if name.startswith("note_"):
             out = self.memory.run_note_tool(name, args)
+            if out is not None:
+                return out
+        if name.startswith("plan_"):
+            out = self.run_plan_tool(chat_id, name, args)
             if out is not None:
                 return out
         return "알 수 없는 도구: %s" % name
@@ -974,26 +1005,17 @@ class Bot(object):
         self._progress(chat_id, "🗜 컨텍스트 압축: 앞 %d단계를 요약으로 접음 (%d→%d자)" % (
             len(step_idx) - self.compact_keep, total, final))
 
-    def run_agent(self, chat_id, user_text):
-        started = time.time()
-        turns = self.load_history(chat_id)
-        messages = [{"role": "system", "content": self.system_prompt(chat_id)}]
-        for turn in turns:
-            messages.extend(turn)
-        this_turn = [{"role": "user", "content": user_text}]
-        messages.extend(this_turn)
-        schemas = self.tool_schemas()
+    def _run_loop(self, chat_id, messages, this_turn, schemas, max_steps, label=""):
+        """도구 루프 본체. 반환 (status, payload):
+          ("final", 답변) / ("limit", 정리보고) / ("cancelled", (step, tools)) /
+          ("error", 메시지) / ("exit", 도구가 남긴 payload — plan_create/plan_step_done)
+        this_turn 은 messages 의 꼬리(같은 dict 객체)라 여기 append 하면 둘 다에 반영된다.
+        """
         step = 0
         tool_count = 0
-
-        def finish(text):
-            self.api.send(chat_id, text)
-            # 작업 도중 /new 가 들어왔으면 예전 기록은 버리고 이번 턴만 남긴다.
-            base = [] if self.history_reset_at.get(str(chat_id), 0) > started else turns
-            self.save_history(chat_id, base + [this_turn])
-
+        self._loop_exit = None
         try:
-            while step < self.max_steps:
+            while step < max_steps:
                 self._check_cancel()
                 self._compact_turn(chat_id, messages, this_turn)
                 stop = threading.Event()
@@ -1004,8 +1026,7 @@ class Bot(object):
                 except Cancelled:
                     raise
                 except Exception as exc:
-                    self.api.send(chat_id, "로컬 모델 호출 실패: %s: %s" % (type(exc).__name__, exc))
-                    return
+                    return ("error", "로컬 모델 호출 실패: %s: %s" % (type(exc).__name__, exc))
                 finally:
                     stop.set()
 
@@ -1026,8 +1047,7 @@ class Bot(object):
                         reason = (msg.get("reasoning_content") or "").strip()
                         final = ("(모델이 최종 답변 없이 사고 과정만 반환했습니다. finish_reason=%s)\n\n%s"
                                  % (finish_reason, reason[-1500:]))
-                    finish(final)
-                    return
+                    return ("final", final)
 
                 step += 1
                 for idx, call in enumerate(calls):
@@ -1055,8 +1075,8 @@ class Bot(object):
                         desc = describe_call(name, args)
                         log("tool", chat_id, name, json.dumps(args, ensure_ascii=False)[:180])
                         self._set_current(step=step, tool=name, tool_desc=desc, tool_at=time.time())
-                        self._progress(chat_id, "%s %d/%d %s · %s" % (
-                            TOOL_ICON.get(name, "🔧"), step, self.max_steps, name, desc))
+                        self._progress(chat_id, "%s %s%d/%d %s · %s" % (
+                            TOOL_ICON.get(name, "🔧"), label, step, max_steps, name, desc))
 
                         needs, reason = self.safety.check(name, args)
                         if needs and not self.approve(chat_id, name, args, reason):
@@ -1077,13 +1097,22 @@ class Bot(object):
                     messages.append(tool_msg)
                     this_turn.append(tool_msg)
 
+                    if self._loop_exit is not None:
+                        # plan_create / plan_step_done 이 루프 종료를 요청 — 남은 호출은 실행하지 않는다
+                        for rest in calls[idx + 1:]:
+                            this_turn.append({"role": "tool", "tool_call_id": rest.get("id") or name,
+                                              "name": (rest.get("function") or {}).get("name") or name,
+                                              "content": "(계획 도구로 이 단계가 끝나 실행 안 함)"})
+                        payload, self._loop_exit = self._loop_exit, None
+                        return ("exit", payload)
+
             # ---- 소프트 한도: 뚝 끊지 않고 정리 보고를 받는다
-            note = ("[시스템] 이번 요청의 도구 사용 한도(%d단계)에 도달했다. 도구를 더 쓰지 말고, "
-                    "지금까지 **한 일 / 확인된 결과 / 남은 일**을 한국어로 정리해 보고하라. "
-                    "남은 일은 마스터가 '이어서 진행해'라고 하면 재개한다." % self.max_steps)
+            note = ("[시스템] 이번 %s의 도구 사용 한도(%d단계)에 도달했다. 도구를 더 쓰지 말고, "
+                    "지금까지 **한 일 / 확인된 결과 / 남은 일**을 한국어로 정리해 보고하라."
+                    % ("단계" if label else "요청", max_steps))
             messages.append({"role": "user", "content": note})
             this_turn.append({"role": "user", "content": note})
-            self._progress(chat_id, "⏸ 도구 한도 %d단계 도달 — 정리 보고 작성 중" % self.max_steps)
+            self._progress(chat_id, "⏸ 도구 한도 %d단계 도달 — 정리 보고 작성 중" % max_steps)
             try:
                 resp = self._complete_cancellable(messages, None, tool_choice="none")
                 msg = ((resp.get("choices") or [{}])[0]).get("message") or {}
@@ -1093,15 +1122,255 @@ class Bot(object):
             except Exception as exc:
                 summary = "(정리 보고 생성 실패: %s: %s)" % (type(exc).__name__, exc)
             this_turn.append({"role": "assistant", "content": summary})
-            finish("⏸ 도구 한도(%d단계)에 도달해 여기서 멈췄습니다. 계속하려면 '이어서 진행해'라고 보내거나 "
-                   "/set steps N 으로 한도를 올려주세요.\n\n%s" % (self.max_steps, summary))
+            return ("limit", summary)
         except Cancelled:
             log("agent cancelled", chat_id, "steps=%d tools=%d" % (step, tool_count))
             this_turn.append({"role": "assistant",
                               "content": "(마스터가 /stop 으로 이 작업을 중단시켰다. %d단계·도구 %d회까지 실행됨. "
                                          "이어서 하려면 어디까지 됐는지 먼저 확인할 것.)" % (step, tool_count)})
+            return ("cancelled", (step, tool_count))
+
+    def run_agent(self, chat_id, user_text):
+        started = time.time()
+        turns = self.load_history(chat_id)
+        messages = [{"role": "system", "content": self.system_prompt(chat_id)}]
+        for turn in turns:
+            messages.extend(turn)
+        # 시각은 시스템 프롬프트가 아니라 사용자 메시지에 붙인다 — 시스템 프롬프트를 고정해 oMLX 프리픽스
+        # 캐시가 요청 사이에도 살아남게 (실측: 콜드 13.9초 vs 캐시 1.5초).
+        this_turn = [{"role": "user", "content": "[%s] %s" % (time.strftime("%Y-%m-%d %H:%M"), user_text)}]
+        messages.extend(this_turn)
+
+        def finish(text):
+            self.api.send(chat_id, text)
+            # 작업 도중 /new 가 들어왔으면 예전 기록은 버리고 이번 턴만 남긴다.
+            base = [] if self.history_reset_at.get(str(chat_id), 0) > started else turns
+            self.save_history(chat_id, base + [this_turn])
+
+        status, payload = self._run_loop(chat_id, messages, this_turn, self.tool_schemas(), self.max_steps)
+        if status == "final":
+            finish(payload)
+        elif status == "limit":
+            finish("⏸ 도구 한도(%d단계)에 도달해 여기서 멈췄습니다. 계속하려면 '이어서 진행해'라고 보내거나 "
+                   "/set steps N 으로 한도를 올려주세요. 큰 일이면 계획으로 쪼개 달라고 해도 됩니다.\n\n%s"
+                   % (self.max_steps, payload))
+        elif status == "cancelled":
             finish("⛔ 중단했습니다 (%d단계, 도구 %d회 실행 후). 진행 중이던 모델 응답은 서버에서 몇 분 더 "
-                   "생성될 수 있습니다." % (step, tool_count))
+                   "생성될 수 있습니다." % payload)
+        elif status == "error":
+            self.api.send(chat_id, payload)
+        elif status == "exit" and payload.get("plan_created"):
+            report = self._run_plan(chat_id, payload["plan_created"])
+            this_turn.append({"role": "assistant", "content": report})
+            finish(report)
+        elif status == "exit":
+            # 계획 밖에서 plan_step_done 을 부른 경우 등 — 그냥 보고로 마무리
+            finish("(계획 도구 호출로 종료: %s)" % json.dumps(payload, ensure_ascii=False)[:300])
+
+    # -------------------------------------------------- 계획 (큰 일을 쪼개서 순차 실행)
+    #
+    # 2026-09-17: "자체적으로 하기에 너무 큰 일은 알아서 계획을 세우고 쪼개서 진행하게" — 모델이
+    # plan_create 로 3~8개 하위 작업을 정의하면, 하위 작업마다 **새 컨텍스트**(시스템 프롬프트 + 계획
+    # 현황 + 이전 단계 결과 요약만)로 도구 루프를 돌린다. 한 요청에 모든 도구 결과가 쌓이는 문제를
+    # 구조적으로 피하고, 단계마다 텔레그램에 진행 보고가 나가며, /stop 후 '이어서 진행해'·/plan resume
+    # 로 멈춘 단계부터 재개된다. 계획은 state/plan-<chat>.json 에 영속화.
+
+    def _plan_path(self, chat_id):
+        return STATE_DIR / ("plan-%s.json" % chat_id)
+
+    def load_plan(self, chat_id):
+        try:
+            return json.loads(self._plan_path(chat_id).read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def save_plan(self, plan):
+        plan["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._plan_path(plan["chat_id"]).write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    PLAN_ICON = {"pending": "⬜", "running": "▶️", "done": "✅", "partial": "🟡", "blocked": "⛔", "skipped": "⏭"}
+
+    def plan_text(self, plan, current=None):
+        lines = ["📋 계획: %s [%s]" % (plan.get("goal"), plan.get("status"))]
+        for st in plan["steps"]:
+            icon = "▶️" if st["n"] == current else self.PLAN_ICON.get(st["status"], "⬜")
+            line = "%s %d. %s" % (icon, st["n"], st["title"])
+            if st.get("result") and st["status"] != "pending":
+                line += " — " + st["result"].replace("\n", " ")[:160]
+            lines.append(line)
+        return "\n".join(lines)
+
+    def plan_tool_schemas(self):
+        def fn(name, desc, props, required):
+            return {"type": "function", "function": {"name": name, "description": desc,
+                    "parameters": {"type": "object", "properties": props, "required": required}}}
+        return [
+            fn("plan_create", "큰 요청을 3~8개 하위 작업으로 쪼개 계획을 만들고 순차 실행을 시작한다. 각 하위 작업은 "
+                              "새 컨텍스트에서 따로 실행되므로 제목만으로 무엇을 할지 알 수 있게 구체적으로 쓴다. "
+                              "이 도구를 부르면 현재 턴은 끝나고 시스템이 1단계부터 실행한다.",
+               {"goal": {"type": "string", "description": "목표 한 문장"},
+                "steps": {"type": "array", "items": {"type": "string"}, "description": "하위 작업 제목 목록(순서대로)"},
+                "note": {"type": "string", "description": "관련 프로젝트 노트 이름(있으면). 완료 시 이력이 자동 추가된다"}},
+               ["goal", "steps"]),
+            fn("plan_step_done", "지금 실행 중인 계획 단계를 끝낸다. summary 에는 다음 단계가 알아야 할 사실"
+                                 "(만든/바꾼 파일 경로, 결정, 남은 문제)을 2~5줄로 쓴다.",
+               {"status": {"type": "string", "enum": ["done", "partial", "blocked"]},
+                "summary": {"type": "string"}}, ["status", "summary"]),
+            fn("plan_add_steps", "실행 중 새로 필요해진 하위 작업을 현재 단계 뒤에 추가한다.",
+               {"steps": {"type": "array", "items": {"type": "string"}}}, ["steps"]),
+        ]
+
+    def run_plan_tool(self, chat_id, name, args):
+        if name == "plan_create":
+            steps = [str(s).strip() for s in (args.get("steps") or []) if str(s).strip()]
+            if len(steps) < 2:
+                return "계획은 2단계 이상이어야 합니다. 작은 일은 계획 없이 바로 처리하세요."
+            plan = {"id": uuid.uuid4().hex[:8], "chat_id": str(chat_id), "goal": str(args.get("goal") or "")[:300],
+                    "request": (self.current or {}).get("entry", {}).get("text", "")[:1000],
+                    "note": str(args.get("note") or "").strip(), "status": "active",
+                    "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "steps": [{"n": i + 1, "title": t[:200], "status": "pending", "result": ""} for i, t in enumerate(steps[:12])]}
+            self.save_plan(plan)
+            self._loop_exit = {"plan_created": plan}
+            return "계획 생성됨 (%d단계). 시스템이 1단계부터 순차 실행합니다." % len(plan["steps"])
+        plan = self.load_plan(chat_id)
+        if name == "plan_step_done":
+            if not plan or plan.get("status") != "active":
+                return "실행 중인 계획이 없습니다. 이 도구는 계획 단계 안에서만 씁니다."
+            status = args.get("status") if args.get("status") in ("done", "partial", "blocked") else "done"
+            self._loop_exit = {"step_done": {"status": status, "summary": str(args.get("summary") or "")[:1500]}}
+            return "단계 종료 기록됨 (%s)." % status
+        if name == "plan_add_steps":
+            if not plan or plan.get("status") != "active":
+                return "실행 중인 계획이 없습니다."
+            new = [str(s).strip() for s in (args.get("steps") or []) if str(s).strip()]
+            cur = next((s["n"] for s in plan["steps"] if s["status"] == "running"), len(plan["steps"]))
+            idx = next((i for i, s in enumerate(plan["steps"]) if s["n"] == cur), len(plan["steps"]) - 1) + 1
+            for t in new:
+                plan["steps"].insert(idx, {"n": 0, "title": t[:200], "status": "pending", "result": ""})
+                idx += 1
+            for i, s in enumerate(plan["steps"]):
+                s["n"] = i + 1
+            self.save_plan(plan)
+            return "단계 %d개 추가됨. 현재 계획:\n%s" % (len(new), self.plan_text(plan))
+        return None
+
+    def _plan_step_prompt(self, plan, step):
+        lines = ["[계획 실행] 목표: %s" % plan["goal"], "원래 요청: %s" % plan.get("request", "")[:600], "", "전체 단계:"]
+        for st in plan["steps"]:
+            icon = "▶️" if st["n"] == step["n"] else self.PLAN_ICON.get(st["status"], "⬜")
+            line = "%s %d. %s" % (icon, st["n"], st["title"])
+            if st["status"] in ("done", "partial", "blocked") and st.get("result"):
+                line += "\n   결과: " + st["result"].strip()[:700]
+            lines.append(line)
+        lines += ["", "지금 할 일: 단계 %d \"%s\". **이 단계만** 처리하라. 이전 단계 결과는 위 요약을 믿되 필요하면 "
+                  "파일/셸로 확인한다. 다음 단계 일을 미리 하지 마라." % (step["n"], step["title"]),
+                  "끝나면 반드시 plan_step_done(status, summary) 를 호출한다 — summary 는 다음 단계가 알아야 할 사실"
+                  "(경로·결정·남은 문제) 2~5줄. 진행 중 새 하위 작업이 필요해지면 plan_add_steps 로 추가한다. "
+                  "막히면 status=blocked 로 이유를 적는다."]
+        return "\n".join(lines)
+
+    def _run_plan(self, chat_id, plan):
+        """계획의 pending 단계를 순서대로 새 컨텍스트에서 실행. 최종 보고 문자열 반환."""
+        total = len(plan["steps"])
+        self.api.send(chat_id, self.plan_text(plan) + "\n\n각 단계는 새 컨텍스트에서 따로 실행되고 끝날 때마다 보고합니다. "
+                                                     "(/plan 현황 · /stop 중단 후 '이어서 진행해'로 재개)")
+        log("plan start", chat_id, plan["id"], "%d단계" % total, plan["goal"][:80])
+        self._set_current(plan=plan["id"])
+        schemas = self.tool_schemas()
+        paused = None
+        while True:
+            plan = self.load_plan(chat_id) or plan
+            step = next((s for s in plan["steps"] if s["status"] == "pending"), None)
+            if step is None:
+                break
+            total = len(plan["steps"])
+            step["status"] = "running"
+            self.save_plan(plan)
+            self._set_current(plan_step="%d/%d %s" % (step["n"], total, step["title"]), status_id=None)
+            self.api.send(chat_id, "▶️ 단계 %d/%d 시작: %s" % (step["n"], total, step["title"]), rich=False)
+            messages = [{"role": "system", "content": self.system_prompt(chat_id)},
+                        {"role": "user", "content": "[%s] %s" % (time.strftime("%Y-%m-%d %H:%M"), self._plan_step_prompt(plan, step))}]
+            this_turn = messages[1:]
+            label = "단계%d " % step["n"]
+            status, payload = self._run_loop(chat_id, messages, this_turn, schemas, self.plan_step_max_steps, label)
+            plan = self.load_plan(chat_id) or plan  # plan_add_steps 로 바뀌었을 수 있음
+            step = next(s for s in plan["steps"] if s["n"] == step["n"])
+            if status == "exit" and payload.get("step_done"):
+                step["status"] = payload["step_done"]["status"]
+                step["result"] = payload["step_done"]["summary"]
+            elif status == "final":
+                step["status"] = "done"
+                step["result"] = payload.strip()[:1500]
+            elif status == "limit":
+                step["status"] = "partial"
+                step["result"] = "(단계 도구 한도 %d 도달) " % self.plan_step_max_steps + payload.strip()[:1200]
+            elif status == "cancelled":
+                step["status"] = "pending"
+                plan["status"] = "paused"
+                paused = "⛔ /stop 으로 계획을 일시정지했습니다 (단계 %d/%d 에서). '이어서 진행해' 또는 /plan resume 로 재개." % (step["n"], total)
+            elif status == "error":
+                step["status"] = "blocked"
+                step["result"] = payload
+                plan["status"] = "paused"
+                paused = "⛔ 단계 %d 에서 오류로 계획을 일시정지했습니다: %s\n/plan resume 로 재개." % (step["n"], payload[:200])
+            else:
+                step["status"] = "blocked"
+                step["result"] = "(예상 밖 종료: %s)" % status
+            self.save_plan(plan)
+            log("plan step", chat_id, plan["id"], "%d/%d" % (step["n"], total), step["status"], (step.get("result") or "")[:80])
+            if paused:
+                break
+            icon = self.PLAN_ICON.get(step["status"], "✅")
+            self.api.send(chat_id, "%s 단계 %d/%d %s\n%s" % (icon, step["n"], total, step["title"], (step.get("result") or "")[:900]))
+            if step["status"] == "blocked":
+                plan["status"] = "paused"
+                self.save_plan(plan)
+                paused = "⛔ 단계 %d 가 막혀 계획을 일시정지했습니다. 원인을 해결한 뒤 /plan resume 또는 '이어서 진행해'." % step["n"]
+                break
+        if paused:
+            self._set_current(plan=None, plan_step=None)
+            return paused + "\n\n" + self.plan_text(plan)
+        # ---- 최종 보고
+        plan["status"] = "done"
+        self.save_plan(plan)
+        digest = "\n".join("%d. %s [%s]\n%s" % (s["n"], s["title"], s["status"], (s.get("result") or "").strip()[:800]) for s in plan["steps"])
+        try:
+            resp = self._complete_cancellable(
+                [{"role": "system", "content": "너는 붐엘이다. 아래는 마스터의 요청을 계획으로 쪼개 실행한 단계별 결과다. "
+                                               "마스터에게 보낼 최종 보고를 한국어로 쓴다: 한 일, 검증된 결과, 부분 완료·막힌 것, "
+                                               "마스터가 확인하거나 결정할 것. 짧은 불릿, 마크다운 표 금지, 한자 금지."},
+                 {"role": "user", "content": "요청: %s\n목표: %s\n\n%s" % (plan.get("request", ""), plan["goal"], digest)}],
+                None, tool_choice="none")
+            report = (((resp.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+        except Exception as exc:
+            report = "(최종 보고 생성 실패: %s)" % exc
+        report = "🏁 계획 완료 (%d단계)\n\n%s" % (len(plan["steps"]), report.strip() or digest)
+        if plan.get("note"):
+            try:
+                self.memory.note_append(plan["note"], "계획 '%s' 완료 (%d단계)" % (plan["goal"][:80], len(plan["steps"])))
+            except Exception:
+                pass
+        log("plan done", chat_id, plan["id"])
+        self._set_current(plan=None, plan_step=None)
+        return report
+
+    def resume_plan(self, chat_id):
+        """/plan resume · '이어서 진행해' — 일시정지된 계획을 멈춘 단계부터."""
+        plan = self.load_plan(chat_id)
+        if not plan or plan.get("status") not in ("paused", "active"):
+            self.api.send(chat_id, "재개할 계획이 없습니다.")
+            return
+        for s in plan["steps"]:
+            if s["status"] in ("running", "blocked"):
+                s["status"] = "pending"
+        plan["status"] = "active"
+        self.save_plan(plan)
+        report = self._run_plan(chat_id, plan)
+        turns = self.load_history(chat_id)
+        self.save_history(chat_id, turns + [[{"role": "user", "content": "[%s] (계획 재개: %s)" % (time.strftime("%Y-%m-%d %H:%M"), plan["goal"][:100])},
+                                            {"role": "assistant", "content": report}]])
+        self.api.send(chat_id, report)
 
     # -------------------------------------------------- 명령어
 
@@ -1119,6 +1388,7 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
 /new      대화 기록 초기화
 /model    현재 로드된 모델
 /soul     SOUL.md 다시 읽기(앞부분 미리보기)
+/plan     계획 현황 · /plan resume 멈춘 단계부터 재개 · /plan cancel 취소
 /memory   자동 요약 기억 보기 (/memory clear 로 비우기 — 백업 남김)
 /notes    프로젝트 노트 목록 (~/Claude_works/boomel-notes)
 /restart  붐엘 프로세스 재시작(코드 반영) — 작업 중이면 /restart now
@@ -1144,6 +1414,8 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
             else:
                 text = (entry.get("text") or "").replace("\n", " ")
                 lines.append("• 작업 중 (%s): \"%s\"" % (elapsed, text[:80] + ("…" if len(text) > 80 else "")))
+                if cur.get("plan_step"):
+                    lines.append("  📋 계획 단계 %s" % cur["plan_step"])
                 if cur.get("tool"):
                     lines.append("  단계 %d/%d · 마지막 도구 %s (%s 전)\n  %s" % (
                         cur.get("step", 0), self.max_steps, cur["tool"],
@@ -1224,6 +1496,28 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
                 note = " 지운 대화 %d턴은 요약해서 기억(/memory)에 남깁니다." % len(old)
             self.api.send(chat_id, "대화 기록을 지웠습니다." + note + (
                 " (진행 중인 작업이 끝나면 그 턴만 새 기록으로 남습니다)" if self.current else ""))
+        elif cmd == "/plan":
+            plan = self.load_plan(chat_id)
+            sub = arg[0].lower() if arg else ""
+            if not plan:
+                self.api.send(chat_id, "계획이 없습니다. 큰 요청을 보내면 붐엘이 plan_create 로 쪼갭니다.")
+            elif sub == "resume":
+                if plan.get("status") == "done":
+                    self.api.send(chat_id, "이미 완료된 계획입니다.")
+                elif self.current is not None:
+                    self.api.send(chat_id, "다른 작업이 진행 중입니다. 끝나면 다시 시도하세요.")
+                else:
+                    entry, _ = self.tasks.add("plan_resume", chat_id, text="(계획 재개) " + plan.get("goal", "")[:100])
+                    self.work.put(entry)
+                    self.api.send(chat_id, "계획을 멈춘 단계부터 재개합니다.")
+            elif sub == "cancel":
+                plan["status"] = "cancelled"
+                self.save_plan(plan)
+                if self.current and (self.current.get("plan") == plan.get("id")):
+                    self._cmd_stop(chat_id, False)
+                self.api.send(chat_id, "계획을 취소했습니다.\n" + self.plan_text(plan))
+            else:
+                self.api.send(chat_id, self.plan_text(plan))
         elif cmd == "/memory":
             if arg and arg[0].lower() == "clear":
                 bak = self.memory.clear_summary(chat_id)
@@ -1373,6 +1667,14 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
                 self._enqueue_boomco(chat_id, urls)
                 return
 
+        # 일시정지된 계획이 있고 "이어서/계속/재개" 류면 계획 재개로 처리
+        plan = self.load_plan(chat_id)
+        if plan and plan.get("status") == "paused" and re.search(r"이어서|계속|재개|resume", text) and len(text) < 40:
+            entry, total = self.tasks.add("plan_resume", chat_id, text="(계획 재개) " + plan.get("goal", "")[:100])
+            self.work.put(entry)
+            if self.current is not None:
+                self.api.send(chat_id, "⏳ 현재 작업이 끝나면 멈춘 계획을 재개합니다.")
+            return
         entry, total = self.tasks.add("chat", chat_id, text=text)
         self.work.put(entry)
         if self.current is not None:
@@ -1430,6 +1732,8 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
             try:
                 if entry.get("kind") == "boomco":
                     self._process_one_boomco(entry)
+                elif entry.get("kind") == "plan_resume":
+                    self.resume_plan(entry["chat_id"])
                 else:
                     self.run_agent(entry["chat_id"], entry.get("text") or "")
             except Exception as exc:

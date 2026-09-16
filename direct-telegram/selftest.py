@@ -434,6 +434,70 @@ def test_bot_flow():
     out = T.run_shell("printf 'ok\\xb0\\xb1 done'", "/tmp", 10)
     check(out.startswith("exit=0") and "done" in out, "비 UTF-8 출력 처리: %s" % out.replace("\n", " ")[:60])
 
+    # 13) 시스템 프롬프트 고정(시각 없음) + SOUL 섹션 건너뛰기 + 기억 프롬프트 상한
+    bot = make_bot([(None, "답")])
+    sp1 = M.Bot.system_prompt(bot, "1"); time.sleep(0.05); sp2 = M.Bot.system_prompt(bot, "1")
+    check(sp1 == sp2 and "현재 시각" not in sp1, "시스템 프롬프트에 시각 없음(캐시 안정)")
+    soul = bot.soul()
+    check("## GPT 폴백" not in soul and "delegate_task" not in soul and "## 정체성과 말투" in soul,
+          "SOUL.md 에서 붐엘 무관 섹션 제거 (%d자)" % len(soul))
+    hist_user = None
+    bot.handle_update(msg("시각 테스트", 50)); wait_idle(bot)
+    hist_user = json.loads(bot._hist_path("1").read_text())[-1][0]["content"]
+    check(hist_user.startswith("[20") and "시각 테스트" in hist_user, "사용자 메시지 앞에 [시각] 접두")
+    bot.memory.prompt_max_chars = 300
+    bot.memory.summary_path("1").write_text("## 2026-01-01\n- " + "옛" * 400 + "\n\n## 2026-09-01\n- 최신 항목\n")
+    block = bot.memory.prompt_block("1")
+    check("최신 항목" in block and "옛옛옛옛옛옛" not in block and "더 오래된 기억 생략" in block, "기억 프롬프트 상한(최신만)")
+
+    # 14) 비밀값 가림
+    import memory as MEM
+    r = MEM.redact_secrets("Basic Auth boss/osvddEjRlNlQBhrH 로 접속, password: hunter2xx, docs/BOOML-GUIDE.md 참고, "
+                           "https://x.com/a/status/2099560613546795262")
+    check("osvdd" not in r and "hunter2xx" not in r and "BOOML-GUIDE.md" in r and "2099560613546795262" in r,
+          "비밀값 가림 (경로·URL 은 보존): %s" % r[:90])
+
+    # 15) 계획: plan_create → 단계별 새 컨텍스트 실행 → 최종 보고, /plan, /stop → 재개
+    script = [([_tc("plan_create", {"goal": "테스트 목표", "steps": ["1단계 조사", "2단계 구현", "3단계 검증"]})], ""),
+              ([_tc("list_dir", {"path": "/tmp"})], ""),
+              ([_tc("plan_step_done", {"status": "done", "summary": "조사 끝: /tmp 확인"})], ""),
+              ([_tc("plan_add_steps", {"steps": ["2.5단계 추가작업"]})], ""),
+              ([_tc("plan_step_done", {"status": "done", "summary": "구현 끝"})], ""),
+              (None, "추가작업 본문만 답함"),
+              ([_tc("plan_step_done", {"status": "partial", "summary": "검증 일부"})], ""),
+              (None, "최종 보고 텍스트")]
+    bot = make_bot(script)
+    bot.max_steps = 10; bot.plan_step_max_steps = 5
+    bot.handle_update(msg("큰 일 시켜", 60))
+    check(wait_idle(bot, 60), "계획 실행 완료")
+    plan = bot.load_plan("1")
+    check(plan and plan["status"] == "done" and len(plan["steps"]) == 4, "계획 4단계(추가 포함) 완료 상태")
+    check([s["status"] for s in plan["steps"]] == ["done", "done", "done", "partial"], "단계 상태 %s" % [s["status"] for s in plan["steps"]])
+    check(any(s.startswith("📋 계획:") for s in bot.api.sent) and any("✅ 단계 1/3" in s for s in bot.api.sent), "계획·단계 보고 전송")
+    check(bot.api.sent[-1].startswith("🏁 계획 완료") and "최종 보고 텍스트" in bot.api.sent[-1], "최종 보고")
+    hist = json.loads(bot._hist_path("1").read_text())[-1]
+    check(hist[-1]["role"] == "assistant" and "🏁" in hist[-1]["content"] and len(hist) <= 4, "기록엔 요청+계획생성+최종보고만 (%d개)" % len(hist))
+    bot.handle_update(msg("/plan", 61))
+    check("📋 계획: 테스트 목표 [done]" in bot.api.sent[-1], "/plan 현황")
+
+    # /stop 으로 일시정지 후 '이어서 진행해' 재개
+    script = [([_tc("plan_create", {"goal": "중단 테스트", "steps": ["느린 단계", "다음 단계"]})], ""),
+              ([_tc("run_shell", {"command": "sleep 30"})], ""),
+              ([_tc("plan_step_done", {"status": "done", "summary": "느린 단계 끝"})], ""),
+              ([_tc("plan_step_done", {"status": "done", "summary": "다음 단계 끝"})], ""),
+              (None, "재개 후 최종")]
+    bot = make_bot(script)
+    bot.handle_update(msg("중단되는 큰 일", 62))
+    time.sleep(1.5)
+    bot.handle_update(msg("/stop", 63))
+    check(wait_idle(bot, 10), "계획 중 /stop 종료")
+    plan = bot.load_plan("1")
+    check(plan["status"] == "paused" and plan["steps"][0]["status"] == "pending", "계획 일시정지, 단계 pending 복원")
+    bot.handle_update(msg("이어서 진행해", 64))
+    check(wait_idle(bot, 30), "'이어서 진행해' 로 재개 완료")
+    plan = bot.load_plan("1")
+    check(plan["status"] == "done" and all(s["status"] == "done" for s in plan["steps"]), "재개 후 전 단계 완료")
+
     print("봇 흐름: 실패 %d" % failed)
     return failed
 

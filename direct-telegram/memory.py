@@ -37,11 +37,31 @@ SUMMARY_SYSTEM = (
 )
 
 COMPRESS_SYSTEM = (
-    "너는 기억 파일 압축기다. 아래는 날짜별로 누적된 작업 요약 기억이다. 같은 내용은 합치고, "
-    "지난 사실로 대체된 것은 최신 것만 남기며, 파일·경로·결정·미완료 항목은 반드시 보존해서 "
-    "전체를 %d자 이내로 줄여라. 형식은 그대로 '## 날짜' 제목 아래 '- ' 불릿. 오래된 항목은 "
-    "여러 날짜를 하나의 '## ~YYYY-MM-DD 이전' 제목으로 합쳐도 된다. 한국어, 한자 금지, 머리말·맺음말 금지."
+    "너는 기억 파일 압축기다. 아래는 날짜별로 누적된 작업 요약 기억이다. 전체를 %d자 이내로 줄여라. "
+    "규칙: ① 끝난 일은 결과 한 줄로만(어떤 파일·서비스가 어떻게 됐는지), 과정·중간 수치·확인 절차는 버린다 "
+    "② 미완료·결정 사항·마스터의 지시와 선호·파일 경로는 반드시 보존 ③ 지난 사실로 대체된 것은 최신 것만 "
+    "④ 비어 있는 항목('없음')은 삭제. 형식은 '## 날짜' 제목 아래 '- ' 불릿, 오래된 여러 날짜는 "
+    "'## ~YYYY-MM-DD 이전' 하나로 합친다. 한국어, 한자 금지, 머리말·맺음말 금지."
 )
+
+# 요약에 비밀값이 새는 것을 막는다 (2026-09-17: 대시보드 관리자 계정/비밀번호가 요약에 평문으로 들어가
+# 매 요청 모델에 전달된 사고). 요약·압축 결과와 노트 쓰기에 모두 적용.
+_SECRET_PATTERNS = [
+    (re.compile(r"(?i)\b(password|passwd|pass|pwd|pw|secret|token|api[_ -]?key|access[_ -]?key|비밀번호|패스워드|토큰)"
+                r"\s*[:=：]\s*[`'\"]?([^\s`'\",)]{4,})"), r"\1: [가림]"),
+    # user/pass 형태: 뒤쪽이 점 없는 8자 이상이고 대문자+소문자(또는 숫자) 섞임 — 경로(`docs/X.md`)는 점 때문에 제외
+    (re.compile(r"(?i)(basic\s*auth|계정|로그인|login|auth|credentials?|아이디|user(?:name)?)([^\n]{0,25}?\b[\w.@-]+)"
+                r"/((?=[^\s/]*[A-Z])(?=[^\s/]*[a-z0-9])[A-Za-z0-9!@#$%^&*_+=-]{8,})(?![\w.-])"), r"\1\2/[가림]"),
+    (re.compile(r"\b\d{8,}:[A-Za-z0-9_-]{30,}\b"), "[텔레그램 토큰 가림]"),
+    (re.compile(r"\b(sk|ghp|gho|xox[bap]|hf)[_-][A-Za-z0-9_-]{16,}\b"), "[토큰 가림]"),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{12,}"), "Bearer [가림]"),
+]
+
+
+def redact_secrets(text):
+    for pat, rep in _SECRET_PATTERNS:
+        text = pat.sub(rep, text)
+    return text
 
 
 def _render_turns(turns, per_tool=600, total=30000):
@@ -75,7 +95,9 @@ class Memory(object):
         self.state_dir = Path(state_dir)
         self.log = log
         self.enabled = bool(mem.get("auto_summary", True))
-        self.max_chars = int(mem.get("max_chars") or 6000)
+        self.max_chars = int(mem.get("max_chars") or 4000)
+        # 프롬프트에는 파일의 뒤쪽(최신) 이만큼만 넣는다 — 파일 상한과 별개로 매 요청 비용을 묶는다
+        self.prompt_max_chars = int(mem.get("prompt_max_chars") or 3500)
         self.notes_dir = Path(os.path.expanduser(mem.get("notes_dir") or "~/Claude_works/boomel-notes"))
         self.hermes_shared = bool(mem.get("hermes_shared", False))  # 기본 off (마스터 지시: 섞이지 않게)
         self.hermes_dir = Path(os.path.expanduser(
@@ -116,9 +138,10 @@ class Memory(object):
         text = _render_turns(turns)
         if len(text) < 200:
             return ""
-        out = self._ask(SUMMARY_SYSTEM, text)
-        # 불릿만 남긴다 (모델이 머리말을 붙이는 경우 대비)
+        out = redact_secrets(self._ask(SUMMARY_SYSTEM, text))
+        # 불릿만 남긴다 (모델이 머리말을 붙이는 경우 대비). '없음' 같은 빈 항목은 버린다.
         bullets = [ln.strip() for ln in out.splitlines() if ln.strip().startswith(("-", "•", "*"))]
+        bullets = [b for b in bullets if b.lstrip("-•* ").strip() not in ("없음", "(없음)", "-")]
         return "\n".join("- " + b.lstrip("-•* ").strip() for b in bullets) if bullets else out[:1500]
 
     def digest(self, chat_id, turns, why="기록 정리"):
@@ -146,7 +169,7 @@ class Memory(object):
     def _compress(self, text):
         target = int(self.max_chars * 0.6)
         try:
-            out = self._ask(COMPRESS_SYSTEM % target, text)
+            out = redact_secrets(self._ask(COMPRESS_SYSTEM % target, text))
             if out and len(out) <= self.max_chars and "##" in out:
                 return out.strip()
         except Exception as exc:
@@ -199,7 +222,7 @@ class Memory(object):
     def note_write(self, name, content):
         p = self._note_path(name)
         self.notes_dir.mkdir(parents=True, exist_ok=True)
-        content = (content or "").rstrip() + "\n"
+        content = redact_secrets((content or "").rstrip()) + "\n"
         if not content.lstrip().startswith("#"):
             content = "# %s\n\n" % p.stem + content
         content = re.sub(r"^최종 갱신:.*$", "", content, count=1, flags=re.M)
@@ -215,7 +238,7 @@ class Memory(object):
         if not p.exists():
             return self.note_write(name, "## 이력\n- %s %s" % (time.strftime("%Y-%m-%d %H:%M"), text))
         body = p.read_text(encoding="utf-8")
-        line = "- %s %s" % (time.strftime("%Y-%m-%d %H:%M"), (text or "").strip())
+        line = "- %s %s" % (time.strftime("%Y-%m-%d %H:%M"), redact_secrets((text or "").strip()))
         if "## 이력" in body:
             body = body.rstrip() + "\n" + line + "\n"
         else:
@@ -256,13 +279,16 @@ class Memory(object):
     def prompt_block(self, chat_id):
         parts = ["\n---\n\n## 기억"]
         summary = self.load_summary(chat_id) if chat_id is not None else ""
-        parts.append("### 이전 대화 자동 요약 (오래된 대화가 정리될 때 시스템이 남긴 것 — 사실로 신뢰하되 "
-                     "현재 상태는 필요하면 파일/셸로 다시 확인)\n" + (summary or "(아직 없음)"))
+        if len(summary) > self.prompt_max_chars:
+            cut = summary[-self.prompt_max_chars:]
+            idx = cut.find("\n## ")
+            summary = "(더 오래된 기억 생략)\n" + (cut[idx + 1:] if idx >= 0 else cut)
+        parts.append("### 이전 대화 자동 요약 (시스템이 남긴 것 — 신뢰하되 현재 상태는 필요하면 파일/셸로 재확인)\n"
+                     + (summary or "(아직 없음)"))
         parts.append("### 프로젝트 노트 (%s/<이름>.md)\n%s\n"
-                     "→ 요청이 기존 프로젝트와 관련되면 **note_read 로 먼저 읽고** 시작하라. 새 프로젝트를 만들거나 "
-                     "작업을 끝냈거나 중요한 결정·변경이 있으면 note_write(전체 갱신) 또는 note_append(이력 한 줄)로 "
-                     "남겨라. 노트는 마스터도 직접 읽고 고치는 문서다 — 구조: 제목, 개요, 현재 상태, 다음 할 일, "
-                     "결정 사항, 이력." % (self.notes_dir, self.note_index_text()))
+                     "→ 관련 요청이면 note_read 로 먼저 읽고 시작. 새 프로젝트·작업 완료·중요 결정은 note_write/"
+                     "note_append 로 남길 것 (구조: 제목·개요·현재 상태·다음 할 일·결정·이력)."
+                     % (self.notes_dir, self.note_index_text()))
         hermes = self.hermes_text()
         if hermes:
             parts.append("### [Hermes 공유] 맥붐이 남긴 기억 — 붐엘의 기억이 아니다. 읽기 전용이며 note_*/자동 요약과 섞지 말 것\n" + hermes)
