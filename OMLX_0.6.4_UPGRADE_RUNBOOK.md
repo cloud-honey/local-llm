@@ -23,6 +23,37 @@
 목표: Qwen3.8-Flash-Next 디코드 속도 개선(제작자 M3 Ultra 실측 +10~15%, 32K 프리필 +33%) + 0.6.4의
 연속배칭·프리픽스 캐시 복원·메모리 가드 버그 수정을 받되, **되돌릴 수 있게** 진행한다.
 
+## 시험 A 결과 (2026-09-17 07:24~07:40) — 네이티브 경로 **성공**, 결정 대기로 원복
+
+디스크 정리 선행: LM Studio 6월 이후 미사용 모델 3개(59GB) + 미참조 HF 캐시 Z-Image-Turbo(31GB) 삭제 → 46GB→135GB 여유.
+
+`Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP`(런타임 형식 키, 이미 디스크에 있음)를 `omlx_serve_native.sh` +
+model_settings(`model_type_override: vlm`, `qwen4_ple_ssd_offload: true`, `is_default: true`)로 띄움. 9/10 의 drafters
+오류는 0.6.4 에서 사라짐. 로드 19초, PLE mmap, 상주 70.9GB, 커널 폴백 경고 없음, 시스템 메모리 여유 32%.
+
+| 구성 | 디코드 (2K/8K/32K) | 콜드 프리필 | 32K 콜드 TTFT | 도구 호출 디코드 |
+|---|---|---|---|---|
+| 128k + 커스텀 로더 (전/후 동일) | 29 / 28 / 27 tok/s | ≈300 tok/s | 96s | 34 |
+| Uncensored 네이티브, MTP 끔 | 30.5 / 31.7 / 31.1 | 407~640 | 45s | 34 |
+| Uncensored 네이티브, Lightning MTP 깊이 3 | 33.6 / 39.6 / 33.5 (캐시 41) | 608~650 | 47s | **57.6** |
+
+바늘 찾기·도구 호출 전부 OK. 첫 2K 콜드 TTFT 27.6s 는 재시작 직후 모델 로드 포함.
+
+**원복한 이유**: 상시 적용하면 기본 모델이 abliterated 변종이 되고, 네이티브 모드에선 128k 빌드를 못 올리므로 128k
+이름을 고정한 클라이언트 6곳이 409 로 죽는다(9/10 사고 재현). 마스터 결정("유지"/"원복") 대기.
+model_settings 의 A 구성은 `.omlx/model_settings.json.A-tested` 로 보관.
+
+**"유지" 시 전환 체크리스트** (Hermes 재시작 포함, 사전 공지):
+1. `.omlx/model_settings.json` ← `model_settings.json.A-tested`, `omlx_upgrade_helper.sh native-on`
+2. 고정 모델명 교체 `Qwen3.8-Flash-Next-oQ4e-128k` → `Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP`:
+   - `~/Claude_works/hermes-agent/data/config.yaml` 2행(`default:`)·192행(`model:`) → Hermes 게이트웨이 재시작
+   - `~/Library/LaunchAgents/ai.hermes.gateway.plist` BOOMCO_TEXT/CRITIC/SERIES_MODEL 3개 (bootout+bootstrap)
+   - `~/Library/LaunchAgents/com.sykim.macboom-direct.plist` 같은 3개 (bootout+bootstrap, 붐엘 재시작)
+   - `~/Library/LaunchAgents/com.sykim.local-llm-mcp-http.plist` DEFAULT_MODEL, `mcp_server*.mjs` 기본값
+   - `~/sns-tracker/scripts/boomco_analyzer.py:571`, `series_detector.py:63` 폴백 문자열
+3. 붐코 1건·맥붐 대화·붐엘 도구 루프 스모크, 컨텍스트 상한 100K 확인(128k 빌드는 131K 였음)
+4. 128k 빌드 폴더(214GB, 캐시 127GB 포함)는 1주 관찰 후 삭제 판단
+
 ## 0. 조사 결과 요약 — 왜 "앱만 바꾸면 끝"이 아닌가
 
 | 항목 | 현재 | 의미 |
