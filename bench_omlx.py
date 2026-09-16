@@ -9,7 +9,9 @@
 1건(finish_reason=tool_calls 여부)과 한국어 짧은 답변 정합성. 결과는 state/bench-<label>-<ts>.json 에
 저장하고 표로 출력한다. 스트리밍으로 첫 청크 시각을 재서 TTFT 를 구한다.
 
-주의: 서버가 다른 요청을 처리 중이면(붐엘·Hermes·붐코) 수치가 흔들린다 — 유휴 시간에 돌릴 것.
+주의: 서버는 동시 요청 1개라 다른 요청(붐엘·Hermes·붐코)이 있으면 그 뒤에 줄을 선다 — TTFT 에 대기 시간이
+통째로 섞여 수치가 무의미해진다(9/17 스모크: 2K 프롬프트 TTFT 175초). 반드시 유휴 시간에 돌릴 것.
+oMLX 스트리밍 usage 에는 cached_tokens 가 안 실릴 수 있어 캐시 효과는 '캐시 TTFT' 열로만 본다.
 """
 import argparse
 import json
@@ -115,6 +117,11 @@ def main():
     ap.add_argument("--gen", type=int, default=256)
     ap.add_argument("--label", default="bench")
     args = ap.parse_args()
+    if args.gen < 200:
+        # 사고(thinking)가 켜진 모델은 첫 100~200 토큰을 추론에 쓰므로 그보다 작으면 바늘 판정이 무조건 실패한다
+        # (9/17 스모크: --gen 32 → content 가 "The user is asking me..." 로 끝남). 속도만 볼 때도 200 이상 권장.
+        print("주의: --gen %d 은 바늘/도구 판정에 부족 — 200 으로 올림" % args.gen)
+        args.gen = 200
     model = model_name()
     print("서버 %s / 모델 %s / 생성 %d토큰 / 프롬프트 %s" % (BASE, model, args.gen, args.sizes))
     out = {"label": args.label, "model": model, "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "sizes": [], "tool": None}
