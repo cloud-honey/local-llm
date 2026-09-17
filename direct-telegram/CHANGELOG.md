@@ -1,5 +1,23 @@
 # 붐엘 변경 이력
 
+## 2026-09-17 (2) — 텔레그램 파일 수신 지원 (document/photo)
+
+배경: "텔레그램으로 파일 보내면 어디 저장돼?"라는 질문에서 확인 — 로컬 telegram-bot-api가
+`data/<봇토큰>/documents/`에 파일을 받아두긴 하지만, 붐엘 코드는 `text`/`caption`만 보고
+`document`/`photo` 필드를 아예 확인하지 않아 "텍스트만 처리할 수 있는 채널입니다"로 무시하고
+있었다.
+
+- `Telegram.get_file_path()`: `getFile` 호출 — 로컬(`--local`) 모드라 cloud API처럼 별도 HTTPS
+  다운로드가 필요 없고 `file_path`가 이 Mac의 절대경로 그대로 옴.
+- `Bot._extract_incoming_file()`: `document` 또는 `photo`(가장 큰 사이즈) 감지.
+- `Bot._handle_incoming_file()`: `state/inbox/<chat_id>/`로 복사(telegram-bot-api 자체 저장소는
+  통제 밖이라 붐엘 소유 경로로 별도 보관) 후, 경로·원본명·크기·타입(+캡션)을 담아 일반 `chat`
+  작업으로 큐에 등록 → 다음 턴에 붐엘이 바로 인지하고 `read_file`/`run_shell`로 처리 가능. 수신
+  즉시 "📎 파일 받음" 회신.
+- 범위: document·photo만 지원. voice/video/audio는 아직 미지원(같은 패턴으로 확장 가능).
+- selftest: 기존 47+80건 그대로 통과(회귀 없음) — 파일 수신 자체는 실제 텔레그램 첨부가 필요해
+  selftest 시나리오에는 아직 미포함.
+
 ## 2026-09-17 — 프롬프트 최적화 4건 + 계획 실행(plan_create)
 
 배경: "기본 MD 파일 용량이 너무 큰 것 같다" → 실측 시스템 프롬프트+도구 8,548토큰(6.7%), 콜드 프리필 13.9초 /

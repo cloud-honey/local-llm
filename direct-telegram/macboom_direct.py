@@ -35,6 +35,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,6 +53,7 @@ from memory import Memory
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / "state"
+INBOX_DIR = STATE_DIR / "inbox"  # 텔레그램으로 받은 파일 보관 (로컬 telegram-bot-api data/ 는 우리 통제 밖이라 여기로 복사)
 LOG_PREFIX = "[macboom-direct]"
 LOG_PATH = BASE_DIR / "bot.out.log"
 
@@ -198,6 +200,21 @@ class Telegram(object):
         except Exception as exc:
             return "전송 실패: %s: %s" % (type(exc).__name__, exc)
         return "전송 완료: %s" % p.name if res else "전송 실패 (텔레그램 응답 오류)"
+
+    def get_file_path(self, file_id):
+        """getFile 로 받은 파일의 로컬 경로를 반환한다.
+
+        로컬 telegram-bot-api(--local 모드)라서 cloud API처럼 별도 HTTPS 다운로드가
+        필요 없다 — result.file_path 자체가 이 Mac의 절대경로다(예: .../data/<token>/documents/file_0.pdf).
+        """
+        res = self._post("getFile", {"file_id": file_id})
+        if not res:
+            return None
+        fp = res.get("file_path")
+        if not fp:
+            return None
+        p = Path(fp)
+        return p if p.is_absolute() else None  # cloud API였으면 상대경로라 별도 다운로드 필요 — local 모드 전제가 깨진 것
 
 
 OFFSET_STATE_PATH = STATE_DIR / "telegram-offset.json"
@@ -1640,6 +1657,57 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
         if "message" in upd:
             self.handle_message(upd["message"], upd.get("update_id"))
 
+    @staticmethod
+    def _extract_incoming_file(msg):
+        """document/photo 메시지에서 file_id 등을 뽑는다. 그 외(voice/video/audio 등)는 아직 미지원."""
+        doc = msg.get("document")
+        if doc:
+            return {"file_id": doc["file_id"], "name": doc.get("file_name") or "file",
+                    "size": doc.get("file_size"), "mime": doc.get("mime_type")}
+        photos = msg.get("photo")
+        if photos:
+            largest = max(photos, key=lambda p: p.get("file_size") or 0)
+            return {"file_id": largest["file_id"], "name": "photo_%s.jpg" % largest.get("file_unique_id", "0"),
+                    "size": largest.get("file_size"), "mime": "image/jpeg"}
+        return None
+
+    @staticmethod
+    def _human_size(n):
+        if not n:
+            return "크기 불명"
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024:
+                return "%.0f%s" % (n, unit) if unit == "B" else "%.1f%s" % (n, unit)
+            n /= 1024.0
+        return "%.1fTB" % n
+
+    def _handle_incoming_file(self, chat_id, file_info, caption_text):
+        """받은 파일을 state/inbox/ 로 복사하고, 절대경로를 담은 채팅 작업을 큐에 넣어
+        붐엘(로컬 LLM 루프)이 다음 턴에 바로 알아채고 read_file/run_shell 등으로 처리할 수 있게 한다."""
+        log("recv file", chat_id, file_info["name"], file_info.get("size"))
+        src = self.api.get_file_path(file_info["file_id"])
+        if src is None or not src.exists():
+            self.api.send(chat_id, "⚠️ 파일 수신 실패 — telegram-bot-api에서 경로를 못 받았습니다 (%s)" % file_info["name"])
+            return
+        dest_dir = INBOX_DIR / chat_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = Path(file_info["name"]).name or "file"
+        dest = dest_dir / ("%s_%s" % (time.strftime("%Y%m%d-%H%M%S"), safe_name))
+        try:
+            shutil.copy2(str(src), str(dest))
+        except Exception as exc:
+            self.api.send(chat_id, "⚠️ 파일 저장 실패: %s: %s" % (type(exc).__name__, exc))
+            return
+        size_str = self._human_size(file_info.get("size"))
+        task_text = "[파일 수신] 사용자가 파일을 보냈습니다.\n경로: %s\n원본 파일명: %s\n크기: %s\n타입: %s" % (
+            dest, file_info["name"], size_str, file_info.get("mime") or "불명")
+        if caption_text:
+            task_text += "\n첨부 메시지: %s" % caption_text
+        entry, total = self.tasks.add("chat", chat_id, text=task_text)
+        self.work.put(entry)
+        self.api.send(chat_id, "📎 파일 받음: %s (%s) — 처리 큐에 등록했습니다 (%d번째)." % (
+            file_info["name"], size_str, total))
+
     def handle_message(self, msg, update_id=None):
         chat_id = str((msg.get("chat") or {}).get("id"))
         text = (msg.get("text") or msg.get("caption") or "").strip()
@@ -1647,6 +1715,12 @@ X 링크만 보내면 붐코 분석 파이프라인이 자동으로 돕니다 (H
             log("허용되지 않은 chat:", chat_id, text[:60])
             self.api.send(chat_id, "이 봇은 허용된 사용자만 쓸 수 있습니다. chat id: %s" % chat_id)
             return
+
+        file_info = self._extract_incoming_file(msg)
+        if file_info is not None:
+            self._handle_incoming_file(chat_id, file_info, text)
+            return
+
         if not text:
             self.api.send(chat_id, "텍스트만 처리할 수 있는 채널입니다.")
             return
