@@ -28,10 +28,14 @@ TRACKED_REPOS = [
     "jedisct1/Qwen3.8-Flash-Next-oQ4e-128k",          # 우리가 지금 쓰는 것 — 복구되는지 확인
     "jedisct1/Qwen3.8-Flash-Next-oQ4e-100K-MTP",       # 후속 빌드 (비전+MTP)
     "jedisct1/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP",
-    "sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit",     # 최우선 후보
+    "sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit",     # 최우선 후보 (2026-09-17: 미해결 루핑 버그로 탈락 판정)
     "Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP",
     "Vontra/Qwen3.8-Flash-Next-MLX-oQ3-MTP",
     "Vontra/Qwen3.8-Flash-Next-MLX-oQ4",               # 비전 유지 빌드
+    # 2026-09-17 추가 — Qwen3.8-Flash-Next 계열 밖 대체 후보 (속도 개선 목적, 전부 검증 미흡한 상태로 보류 중)
+    "mlx-community/gpt-oss-120b-MXFP4-Q8",             # OpenAI, mlx-lm 툴콜 파싱 이슈(#858) 해결 여부 지켜볼 것
+    "inclusionAI/Ling-3.0-flash",                      # Ant Group, MLX 환경 툴콜 미인식 버그 있음(실사용 리포트)
+    "mlx-community/Solar-Open-100B-4bit",              # Upstage(한국), 한국어 검증은 최고지만 활성12B+MLX 실사용 전무
 ]
 
 # 새 업로드 감지용 — 이 작성자의 Qwen3.8-Flash-Next 계열 전체를 조회해서
@@ -42,6 +46,9 @@ AUTHOR_SEARCH_TERM = "Qwen3.8-Flash-Next"
 # 이슈/버그 트래커까지 확인하는 저장소 (신뢰도 판단에 중요한 것만, API 호출 아끼기 위해 제한)
 DISCUSSIONS_WATCH = [
     "sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit",
+    "mlx-community/gpt-oss-120b-MXFP4-Q8",
+    "inclusionAI/Ling-3.0-flash",
+    "mlx-community/Solar-Open-100B-4bit",
 ]
 
 UA = {"User-Agent": "boomco-model-watch/1.0"}
