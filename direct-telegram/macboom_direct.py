@@ -635,6 +635,18 @@ DIRECT_ADDENDUM = """
   컨텍스트에서 따로 실행되니 제목만 보고 할 수 있게 구체적으로 쓴다. 단순 질문·조회·한두 파일 수정은
   계획 없이 바로 처리한다. 계획 단계 안에서는 그 단계만 하고 `plan_step_done` 으로 끝낸다.
 
+- **작업 결과물은 항상 git으로 기록해라.** 너는 claude-mem 같은 세션 간 기억이 없어서, 다음 대화나
+  재시작 후에 "무엇을 언제 왜 만들었는지"를 git 로그로만 되짚을 수 있다. 프로젝트 파일(md·svg·html
+  등 산출물)을 새로 쓰거나 의미 있게 고쳤으면, 그 작업 마무리 단계에서:
+  1. 그 디렉터리가 git 저장소인지 확인(`git status`). 아니면 `git init` 부터 한다.
+  2. `git add`는 **방금 만들거나 고친 파일만 이름으로 지정**한다(`git add -A`/`.` 금지 — 사용자의
+     다른 작업 중인 파일을 모르고 같이 커밋할 수 있다).
+  3. `git commit -m "..."`으로 남긴다. 메시지는 무엇을·왜 했는지 한국어 한두 줄.
+  4. `git push`는 **원격(origin)이 이미 설정된 저장소에서만**, 그리고 그것도 원래 그 저장소가
+     푸시하던 습관이 있을 때만 한다. 원격이 없으면 로컬 커밋으로 충분 — 만들지 마라.
+  간단한 질문 답변이나 파일 안 바뀌는 조회 작업에는 해당 없다. 이것도 "완료" 보고 전에 하는
+  일이니, 실제로 `git log`나 `git show`로 커밋이 반영됐는지 확인한 뒤에 완료라고 말해라.
+
 작업 디렉터리: {workdir} / 로컬 모델: {model} / 메시지 앞의 [날짜 시각]이 그 메시지를 받은 시각(KST)이다.
 """
 
@@ -642,7 +654,7 @@ YES_WORDS = ("y", "yes", "ok", "ㅇ", "ㅇㅇ", "응", "네", "승인", "실행"
 NO_WORDS = ("n", "no", "ㄴ", "ㄴㄴ", "아니", "아니오", "거부", "취소", "하지마", "stop")
 
 TOOL_ICON = {"run_shell": "🔧", "run_python": "🐍", "read_file": "📖", "write_file": "✍️",
-             "edit_file": "✏️", "list_dir": "📂", "web_fetch": "🌐", "boomco_analyze_x": "🔍",
+             "edit_file": "✏️", "list_dir": "📂", "web_fetch": "🌐", "web_search": "🔎", "boomco_analyze_x": "🔍",
              "send_file_to_master": "📎", "system_status": "🩺"}
 
 
@@ -669,6 +681,8 @@ def describe_call(name, args):
         return "%s (교체: %s)" % (_short_path(args.get("path")), (old[0][:50] if old else "?"))
     if name == "web_fetch":
         return str(args.get("url") or "")[:110]
+    if name == "web_search":
+        return str(args.get("query") or "")[:110]
     if name == "boomco_analyze_x":
         return str(args.get("url") or "")
     if name.startswith("toss_"):
@@ -820,6 +834,8 @@ class Bot(object):
             return T.list_dir(args.get("path") or self.workdir)
         if name == "web_fetch":
             return T.web_fetch(str(args.get("url") or ""), args.get("max_chars") or 5000)
+        if name == "web_search":
+            return T.web_search(str(args.get("query") or ""), args.get("limit") or 5)
         if name == "boomco_analyze_x":
             notify = lambda text: self.api.send(chat_id, text)
             summary, report = T.boomco_analyze(str(args.get("url") or ""), chat_id, notify)

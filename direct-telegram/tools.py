@@ -296,6 +296,132 @@ def web_fetch(url, max_chars=5000):
     return _clip(text.strip(), int(max_chars or 5000))
 
 
+# ---------------------------------------------------------------- 웹 검색 (무료 Parallel MCP)
+#
+# Hermes(app/plugins/web/parallel/provider.py)가 API 키 없을 때 쓰는 것과 같은
+# 익명(무료) Search MCP — 재구현이 아니라 같은 엔드포인트·프로토콜을 그대로 씀.
+# 키 없는 요금제라 속도/한도가 유료 백엔드보다 낮을 수 있음.
+
+_MCP_SEARCH_URL = "https://search.parallel.ai/mcp"
+_MCP_PROTOCOL_VERSION = "2025-06-18"
+_MCP_CLIENT_NAME = "macboom-direct"
+_MCP_CLIENT_VERSION = "1.0.0"
+_MCP_USER_AGENT = "%s/%s" % (_MCP_CLIENT_NAME, _MCP_CLIENT_VERSION)
+
+
+def _mcp_headers(session_id, protocol_version=None):
+    headers = {"Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream",
+               "User-Agent": _MCP_USER_AGENT}
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    if protocol_version:
+        headers["MCP-Protocol-Version"] = protocol_version
+    return headers
+
+
+def _mcp_messages(text):
+    """SSE(text/event-stream) 또는 순수 JSON 응답 바디에서 JSON-RPC 메시지들을 뽑는다."""
+    body = (text or "").strip()
+    if not body:
+        return
+    if body[0] in "{[":
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            return
+        for m in (parsed if isinstance(parsed, list) else [parsed]):
+            yield m
+        return
+    data_lines = []
+    for raw in body.split("\n"):
+        line = raw.rstrip("\r")
+        if line.startswith("data:"):
+            data_lines.append(line[len("data:"):].lstrip())
+        elif not line.strip() and data_lines:
+            try:
+                yield json.loads("\n".join(data_lines))
+            except ValueError:
+                pass
+            data_lines = []
+    if data_lines:
+        try:
+            yield json.loads("\n".join(data_lines))
+        except ValueError:
+            pass
+
+
+def _mcp_envelope(text, request_id):
+    fallback = {}
+    for msg in _mcp_messages(text):
+        if not isinstance(msg, dict) or ("result" not in msg and "error" not in msg):
+            continue
+        if msg.get("id") == request_id:
+            return msg
+        fallback = msg
+    return fallback
+
+
+def _mcp_call(tool_name, arguments, timeout=30):
+    """MCP 3단계 핸드셰이크(initialize → notifications/initialized → tools/call)."""
+    sess = requests.Session()
+    init_id = "init-%d" % int(time.time() * 1000)
+    init = sess.post(_MCP_SEARCH_URL, headers=_mcp_headers(None),
+                     json={"jsonrpc": "2.0", "id": init_id, "method": "initialize",
+                           "params": {"protocolVersion": _MCP_PROTOCOL_VERSION, "capabilities": {},
+                                      "clientInfo": {"name": _MCP_CLIENT_NAME, "version": _MCP_CLIENT_VERSION}}},
+                     timeout=timeout)
+    init.raise_for_status()
+    mcp_session_id = init.headers.get("mcp-session-id")
+    init_env = _mcp_envelope(init.text, init_id)
+    negotiated = (init_env.get("result") or {}).get("protocolVersion") or _MCP_PROTOCOL_VERSION
+
+    sess.post(_MCP_SEARCH_URL, headers=_mcp_headers(mcp_session_id, negotiated),
+             json={"jsonrpc": "2.0", "method": "notifications/initialized"}, timeout=timeout)
+
+    call_id = "call-%d" % int(time.time() * 1000)
+    call = sess.post(_MCP_SEARCH_URL, headers=_mcp_headers(mcp_session_id, negotiated),
+                     json={"jsonrpc": "2.0", "id": call_id, "method": "tools/call",
+                           "params": {"name": tool_name, "arguments": arguments}}, timeout=timeout)
+    call.raise_for_status()
+    envelope = _mcp_envelope(call.text, call_id)
+    if "error" in envelope:
+        raise RuntimeError("MCP 오류: %s" % str(envelope["error"])[:300])
+    result = envelope.get("result") or {}
+    if result.get("isError"):
+        raise RuntimeError("MCP 도구 오류: %s" % str(result)[:300])
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    for block in result.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            try:
+                return json.loads(block["text"])
+            except ValueError:
+                return {"text": block["text"]}
+    return {}
+
+
+def web_search(query, limit=5):
+    try:
+        payload = _mcp_call("web_search", {"objective": query, "search_queries": [query],
+                                            "session_id": "macboom-%d" % int(time.time())})
+    except Exception as exc:
+        return "검색 실패: %s: %s" % (type(exc).__name__, exc)
+    results = (payload.get("results") or [])[: max(int(limit or 5), 1)]
+    if not results:
+        return "검색 결과 없음"
+    lines = []
+    for i, r in enumerate(results, 1):
+        if not isinstance(r, dict):
+            continue
+        excerpts = r.get("excerpts") or []
+        lines.append("%d. %s\n   %s\n   %s" % (
+            i, r.get("title") or "(제목 없음)", r.get("url") or "",
+            " ".join(excerpts)[:400] if excerpts else "(요약 없음)"))
+    return _clip("\n".join(lines))
+
+
 def system_status(llm_base, model_id, api_key="omlx", queue_note=""):
     """현재 상태 보고용 — 로컬 모델/게이트웨이/봇 프로세스 실태."""
     parts = []
@@ -349,6 +475,9 @@ def tool_schemas():
         fn("list_dir", "디렉터리 목록(이름/크기)을 본다.", {"path": {"type": "string"}}, []),
         fn("web_fetch", "URL을 가져와 본문 텍스트로 변환한다.",
            {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, ["url"]),
+        fn("web_search", "웹 검색(무료 백엔드, 키 불필요). 결과는 제목·URL·요약 목록.",
+           {"query": {"type": "string"}, "limit": {"type": "integer", "description": "결과 개수(기본 5)"}},
+           ["query"]),
         fn("boomco_analyze_x", "X(트위터) 게시물 링크를 로컬 2단계 분석 파이프라인으로 분석하고 "
                                "붐코 피드에 저장한다. 수 분~20분 걸린다.",
            {"url": {"type": "string", "description": "https://x.com/<user>/status/<id>"}}, ["url"]),
