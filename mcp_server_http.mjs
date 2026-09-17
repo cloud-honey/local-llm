@@ -16,6 +16,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { buildSelfSystemPrompt } from "./self_info.mjs";
+import { webSearch } from "./web_search.mjs";
 
 // 2026-08-29: 기본 채팅 모델을 LM Studio(qwen3.8-27b)에서 oMLX(Qwen3.8-Flash-Next-oQ4e-128k)로 교체.
 // VISION_MODEL은 oMLX가 vision을 지원하지 않아 사실상 폐기 상태 (이미지 분석은 Claude/GPT로 직접 처리).
@@ -141,6 +142,18 @@ const TOOLS = [
       required: ["code"],
     },
   },
+  {
+    name: "web_search",
+    description: "웹 검색(무료 백엔드, 키 불필요). 결과는 제목·URL·요약 목록.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "검색어" },
+        limit: { type: "integer", description: "결과 개수(기본 5)" },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 async function handleToolCall(name, args) {
@@ -201,6 +214,11 @@ async function handleToolCall(name, args) {
       { temperature: 0.3 }
     );
     return { content: [{ type: "text", text: reply }] };
+  }
+
+  if (name === "web_search") {
+    const text = await webSearch(args.query, args.limit || 5);
+    return { content: [{ type: "text", text }] };
   }
 
   throw new Error(`Unknown tool: ${name}`);
