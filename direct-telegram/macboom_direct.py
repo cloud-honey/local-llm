@@ -400,6 +400,14 @@ def _real(path):
     return os.path.realpath(os.path.expandvars(os.path.expanduser(str(path))))
 
 
+def _real_in(path, cwd):
+    """_real() 과 같지만, path 가 상대경로면 cwd 기준으로 먼저 붙인다."""
+    expanded = os.path.expandvars(os.path.expanduser(str(path)))
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(cwd, expanded)
+    return os.path.realpath(expanded)
+
+
 def _under(real, roots):
     return any(real == r or real.startswith(r + os.sep) for r in roots)
 
@@ -415,6 +423,9 @@ class Safety(object):
         self.write_roots = [_real(p) for p in (s.get("write_roots") or DEFAULT_WRITE_ROOTS)]
         self.rm_free_roots = [_real(p) for p in RM_FREE_ROOTS]
         self.approval_timeout = int(s.get("approval_timeout") or 300)
+        # run_shell 이 실제로 이 디렉터리에서 실행되므로(tools.run_shell(cmd, workdir)),
+        # rm 대상의 상대경로도 여기 기준으로 풀어야 한다 — 이 프로세스 자신의 cwd 기준이면 안 됨.
+        self.default_cwd = os.path.expanduser(cfg.get("workdir") or "~/Claude_works")
 
     # ---- 경로 판정
     def is_secret(self, path):
@@ -431,15 +442,26 @@ class Safety(object):
         return _under(_real(path), self.write_roots)
 
     # ---- rm 판정: 임시 디렉터리 안의 명시적 경로만 자유. 와일드카드·그 밖 경로는 승인.
+    #
+    # 2026-09-17: `cd /tmp && rm -rf s1` 같은 상대경로가 이 프로세스 자신의 cwd(run_shell 이
+    # 실제로 쓰는 workdir 와 다름) 기준으로 풀려서 "임시 디렉터리 밖"으로 오판·불필요한 승인
+    # 요청이 뜬 사고 — 같은 명령 문자열 안의 cd 를 순서대로 반영해 cwd 를 추적한다.
     def rm_reason(self, command):
+        cwd = self.default_cwd
         for seg in re.split(r"\n|;|&&|\|\||\|", command):
             seg = seg.strip()
-            if not seg or not re.search(r"(^|\s|/)rm(\s|$)", seg):
+            if not seg:
                 continue
             try:
                 toks = shlex.split(seg)
             except ValueError:
                 toks = seg.split()
+            if toks and toks[0] == "cd":
+                dest = toks[1] if len(toks) > 1 else "~"
+                cwd = _real_in(dest, cwd)
+                continue
+            if not re.search(r"(^|\s|/)rm(\s|$)", seg):
+                continue
             for i, tok in enumerate(toks):
                 if tok != "rm" and not tok.endswith("/rm"):
                     continue
@@ -449,7 +471,7 @@ class Safety(object):
                 for tgt in targets:
                     if any(c in tgt for c in "*?[{"):
                         return "와일드카드 삭제: rm %s" % tgt
-                    if not _under(_real(tgt), self.rm_free_roots):
+                    if not _under(_real_in(tgt, cwd), self.rm_free_roots):
                         return "임시 디렉터리 밖 파일 삭제: rm %s" % tgt
         return ""
 

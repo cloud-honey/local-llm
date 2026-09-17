@@ -1,5 +1,23 @@
 # 붐엘 변경 이력
 
+## 2026-09-17 (3) — rm 안전검사 cd 추적 fix + temperature 1.0 + 100K 네이티브 모델 전환 시험
+
+배경: PLC 문서 작업 중 붐엘이 반복해서 "도구 호출 없이 텍스트만 내다 끊김" 패턴으로 멈춤(대화형
+zip 요청, 도구 거부 직후, 2편 작성 시도 각각 다른 트리거로 3회). 원인 조사 중 안전검사 오탐도 발견.
+
+- **fix**: `Safety.rm_reason()`이 `cd /tmp && rm -rf s1`처럼 상대경로 rm을 **이 프로세스 자신의
+  cwd**(run_shell 실제 실행 위치인 `workdir`와 다름) 기준으로 풀어 "임시 디렉터리 밖"으로 오판 →
+  불필요한 승인 요청 → 5분 타임아웃 자동거부 → 거부 직후 반복(토큰 루프) 붕괴로 이어진 사고.
+  `_real_in(path, cwd)` 추가, 같은 명령 문자열 안의 `cd`를 세그먼트별로 추적해 상대경로를 실제
+  실행 cwd 기준으로 해석하도록 수정. 테스트 7건(원 사고 재현 포함) 통과, selftest 회귀 없음.
+- **config**: `llm.temperature` 0.4→1.0 (Qwen 공식 Thinking 모드 권장값. config.yaml은 gitignore라
+  여기 기록만 남김). 긴 추론사슬 반복 완화 목적이었으나 도구 거부 트리거 케이스에서는 재발 —
+  근본 원인이 아니라 부분적 완화로 판단.
+- **모델 전환 시험**: oMLX를 `Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP` 네이티브 경로로 전환해
+  같은 실패 패턴이 재현되는지 실사용 A/B 테스트 진행 (`omlx_upgrade_helper.sh native-on` +
+  `model_settings.json.A-tested` 적용, 롤백용 `model_settings.json.bak-pre-swap-20260917-194034`
+  별도 보관). 결과는 다음 항목에 기록.
+
 ## 2026-09-17 (2) — 텔레그램 파일 수신 지원 (document/photo)
 
 배경: "텔레그램으로 파일 보내면 어디 저장돼?"라는 질문에서 확인 — 로컬 telegram-bot-api가
