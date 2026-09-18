@@ -488,14 +488,24 @@ class Safety(object):
                 if r:
                     return True, r
             return False, ""
-        if name in ("write_file", "edit_file"):
-            path = args.get("path") or ""
+        if name in ("write_file", "edit_file", "download_file"):
+            path = args.get("path") or args.get("dest") or ""
             if self.is_secret(path):
                 return True, "비밀정보 파일 수정: %s" % path
             if self.is_write_protected(path):
                 return True, "붐엘/Hermes 핵심 파일 수정(자기 파괴 방지): %s" % path
             if not self.in_write_roots(path):
                 return True, "홈 디렉터리 밖에 쓰기: %s" % path
+            return False, ""
+        if name == "compress_files":
+            dest = args.get("dest") or ""
+            if self.is_write_protected(dest):
+                return True, "붐엘/Hermes 핵심 파일 수정(자기 파괴 방지): %s" % dest
+            if not self.in_write_roots(dest):
+                return True, "홈 디렉터리 밖에 쓰기: %s" % dest
+            for p in (args.get("paths") or []):
+                if self.is_secret(p):
+                    return True, "비밀정보 포함 가능 경로 압축: %s" % p
             return False, ""
         if name in ("read_file", "send_file_to_master"):
             if self.is_secret(args.get("path") or ""):
@@ -654,7 +664,8 @@ YES_WORDS = ("y", "yes", "ok", "ㅇ", "ㅇㅇ", "응", "네", "승인", "실행"
 NO_WORDS = ("n", "no", "ㄴ", "ㄴㄴ", "아니", "아니오", "거부", "취소", "하지마", "stop")
 
 TOOL_ICON = {"run_shell": "🔧", "run_python": "🐍", "read_file": "📖", "write_file": "✍️",
-             "edit_file": "✏️", "list_dir": "📂", "web_fetch": "🌐", "web_search": "🔎", "boomco_analyze_x": "🔍",
+             "edit_file": "✏️", "list_dir": "📂", "web_fetch": "🌐", "web_search": "🔎",
+             "download_file": "⬇️", "compress_files": "🗜️", "boomco_analyze_x": "🔍",
              "send_file_to_master": "📎", "system_status": "🩺"}
 
 
@@ -683,6 +694,11 @@ def describe_call(name, args):
         return str(args.get("url") or "")[:110]
     if name == "web_search":
         return str(args.get("query") or "")[:110]
+    if name == "download_file":
+        return "%s → %s" % (str(args.get("url") or "")[:60], _short_path(args.get("path") or ""))
+    if name == "compress_files":
+        n = len(args.get("paths") or [])
+        return "%d개 → %s" % (n, _short_path(args.get("dest") or ""))
     if name == "boomco_analyze_x":
         return str(args.get("url") or "")
     if name.startswith("toss_"):
@@ -836,6 +852,10 @@ class Bot(object):
             return T.web_fetch(str(args.get("url") or ""), args.get("max_chars") or 5000)
         if name == "web_search":
             return T.web_search(str(args.get("query") or ""), args.get("limit") or 5)
+        if name == "download_file":
+            return T.download_file(str(args.get("url") or ""), args.get("path"), args.get("max_bytes"))
+        if name == "compress_files":
+            return T.compress_files(args.get("paths") or [], args.get("dest"))
         if name == "boomco_analyze_x":
             notify = lambda text: self.api.send(chat_id, text)
             summary, report = T.boomco_analyze(str(args.get("url") or ""), chat_id, notify)

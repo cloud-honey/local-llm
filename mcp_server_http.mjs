@@ -17,6 +17,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { buildSelfSystemPrompt } from "./self_info.mjs";
 import { webSearch } from "./web_search.mjs";
+import { downloadFile, compressFiles } from "./file_tools.mjs";
 
 // 2026-08-29: 기본 채팅 모델을 LM Studio(qwen3.8-27b)에서 oMLX(Qwen3.8-Flash-Next-oQ4e-128k)로 교체.
 // VISION_MODEL은 oMLX가 vision을 지원하지 않아 사실상 폐기 상태 (이미지 분석은 Claude/GPT로 직접 처리).
@@ -154,6 +155,31 @@ const TOOLS = [
       required: ["query"],
     },
   },
+  {
+    name: "download_file",
+    description: "URL의 바이너리 파일(이미지·PDF 등)을 이 Mac의 로컬 경로에 저장합니다.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string" },
+        path: { type: "string", description: "저장할 로컬 경로" },
+        max_bytes: { type: "integer", description: "허용 최대 크기(기본 200MB)" },
+      },
+      required: ["url", "path"],
+    },
+  },
+  {
+    name: "compress_files",
+    description: "이 Mac의 파일/디렉터리 목록을 zip 하나로 묶습니다.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        paths: { type: "array", items: { type: "string" }, description: "압축할 파일·디렉터리 경로들" },
+        dest: { type: "string", description: "결과 zip 경로" },
+      },
+      required: ["paths", "dest"],
+    },
+  },
 ];
 
 async function handleToolCall(name, args) {
@@ -218,6 +244,16 @@ async function handleToolCall(name, args) {
 
   if (name === "web_search") {
     const text = await webSearch(args.query, args.limit || 5);
+    return { content: [{ type: "text", text }] };
+  }
+
+  if (name === "download_file") {
+    const text = await downloadFile(args.url, args.path, args.max_bytes);
+    return { content: [{ type: "text", text }] };
+  }
+
+  if (name === "compress_files") {
+    const text = await compressFiles(args.paths, args.dest);
     return { content: [{ type: "text", text }] };
   }
 

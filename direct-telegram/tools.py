@@ -296,6 +296,71 @@ def web_fetch(url, max_chars=5000):
     return _clip(text.strip(), int(max_chars or 5000))
 
 
+_MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200MB — 무제한 다운로드로 디스크 채우는 것 방지
+
+
+def download_file(url, path, max_bytes=None):
+    """URL을 스트리밍으로 받아 로컬 파일로 저장한다(이미지·PDF 등 바이너리, web_fetch는 텍스트 전용)."""
+    cap = int(max_bytes or _MAX_DOWNLOAD_BYTES)
+    dest = Path(os.path.expanduser(str(path)))
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with requests.get(url, stream=True, timeout=60,
+                          headers={"User-Agent": "Mozilla/5.0 (macboom-direct)"}) as resp:
+            resp.raise_for_status()
+            ctype = resp.headers.get("content-type", "")
+            clen = resp.headers.get("content-length")
+            if clen and int(clen) > cap:
+                return "다운로드 취소: 선언된 크기 %.1fMB가 한도(%.0fMB) 초과" % (int(clen) / 1e6, cap / 1e6)
+            written = 0
+            tmp = dest.with_suffix(dest.suffix + ".part")
+            with tmp.open("wb") as fh:
+                for chunk in resp.iter_content(chunk_size=262144):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > cap:
+                        tmp.unlink(missing_ok=True)
+                        return "다운로드 취소: 실제 크기가 한도(%.0fMB) 초과해서 중단" % (cap / 1e6)
+                    fh.write(chunk)
+            tmp.replace(dest)
+    except Exception as exc:
+        return "다운로드 실패: %s: %s" % (type(exc).__name__, exc)
+    return "저장 완료: %s (%.2fMB, %s)" % (dest, written / 1e6, ctype or "타입 불명")
+
+
+def compress_files(paths, dest):
+    """paths(파일·디렉터리 목록)를 dest 경로의 zip 하나로 묶는다. 디렉터리는 재귀적으로 담는다."""
+    import zipfile
+
+    dest_path = Path(os.path.expanduser(str(dest)))
+    if not str(dest_path).lower().endswith(".zip"):
+        dest_path = dest_path.with_suffix(".zip")
+    items = paths if isinstance(paths, list) else [paths]
+    if not items:
+        return "압축 실패: paths가 비어있음"
+    try:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        added = 0
+        with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for raw in items:
+                src = Path(os.path.expanduser(str(raw)))
+                if not src.exists():
+                    return "압축 실패: 없는 경로 %s" % src
+                if src.is_dir():
+                    for f in src.rglob("*"):
+                        if f.is_file():
+                            zf.write(f, arcname=str(f.relative_to(src.parent)))
+                            added += 1
+                else:
+                    zf.write(src, arcname=src.name)
+                    added += 1
+    except Exception as exc:
+        return "압축 실패: %s: %s" % (type(exc).__name__, exc)
+    size = dest_path.stat().st_size
+    return "압축 완료: %s (%d개 파일, %.2fMB)" % (dest_path, added, size / 1e6)
+
+
 # ---------------------------------------------------------------- 웹 검색 (무료 Parallel MCP)
 #
 # Hermes(app/plugins/web/parallel/provider.py)가 API 키 없을 때 쓰는 것과 같은
@@ -478,6 +543,15 @@ def tool_schemas():
         fn("web_search", "웹 검색(무료 백엔드, 키 불필요). 결과는 제목·URL·요약 목록.",
            {"query": {"type": "string"}, "limit": {"type": "integer", "description": "결과 개수(기본 5)"}},
            ["query"]),
+        fn("download_file", "URL의 바이너리 파일(이미지·PDF 등)을 로컬 경로에 저장한다. "
+                            "텍스트만 필요하면 web_fetch를 쓸 것.",
+           {"url": {"type": "string"}, "path": {"type": "string", "description": "저장할 로컬 경로"},
+            "max_bytes": {"type": "integer", "description": "허용 최대 크기(기본 200MB)"}},
+           ["url", "path"]),
+        fn("compress_files", "파일/디렉터리 목록을 zip 하나로 묶는다.",
+           {"paths": {"type": "array", "items": {"type": "string"}, "description": "압축할 파일·디렉터리 경로들"},
+            "dest": {"type": "string", "description": "결과 zip 경로"}},
+           ["paths", "dest"]),
         fn("boomco_analyze_x", "X(트위터) 게시물 링크를 로컬 2단계 분석 파이프라인으로 분석하고 "
                                "붐코 피드에 저장한다. 수 분~20분 걸린다.",
            {"url": {"type": "string", "description": "https://x.com/<user>/status/<id>"}}, ["url"]),
